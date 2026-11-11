@@ -1,0 +1,19 @@
+version = "1.0"
+
+[metadata]
+author_name = "Andy (Phoenix DevOps)"
+difficulty = "hard"
+category = "systems"
+subcategory = "systems"
+tags = ["canary", "progressive-delivery", "haproxy", "network-namespaces", "observability", "rollback"]
+expert_time_estimate_min = 150
+junior_time_estimate_min = 600
+
+[verifier]
+timeout_sec = 900
+
+[agent]
+timeout_sec = 7200
+
+[environment]
+build_timeout_sec = 900

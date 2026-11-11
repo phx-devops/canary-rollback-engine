@@ -1,0 +1,10 @@
+services:
+  client:
+    build: .
+    # PID 1 must reap orphans: the toolchain's daemons are reparented to it, and a killed one must
+    # not linger as a zombie. (The entrypoint's `sleep infinity` would never reap.)
+    init: true
+    # ip netns needs these to create/enter the provided namespace; the agent's
+    # engine itself must hold no capabilities.
+    cap_add: [NET_ADMIN, SYS_ADMIN]
+    security_opt: ["apparmor=unconfined"]

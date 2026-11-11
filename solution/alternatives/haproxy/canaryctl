@@ -1,0 +1,84 @@
+#!/usr/bin/env python3
+"""canaryctl up | start [--dwell S] | status | reset"""
+import argparse, json, os, pwd, shutil, signal, socket, subprocess, sys, time, uuid
+HERE = os.path.dirname(os.path.realpath(__file__)); sys.path.insert(0, HERE)
+from common import RUN, LOGDIR, HAP_SOCK, STATUS, EVENTS, set_weights, write_status, event
+
+U = pwd.getpwnam("canary"); NETNS = "/run/netns/canary"
+ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "HOME": U.pw_dir, "USER": "canary", "LANG": "C.UTF-8"}
+
+def in_target():
+    return os.getuid() == U.pw_uid and os.stat("/proc/self/ns/net").st_ino == os.stat(NETNS).st_ino
+
+def launch(argv, log):
+    """Start argv detached (new session, no tty, reparented) as canary with no capabilities, inside the netns."""
+    if os.getuid() == 0:
+        pre = ["nsenter", f"--net={NETNS}", "--", "setpriv", f"--reuid={U.pw_uid}", f"--regid={U.pw_gid}", "--clear-groups",
+               "--inh-caps=-all", "--bounding-set=-all", "--no-new-privs", "--", "setsid", "-f"]
+    elif in_target(): pre = ["setsid", "-f"]
+    else: sys.exit("canaryctl: run as root, or as canary inside the canary network namespace")
+    with open(log, "ab") as lf:
+        if os.getuid() == 0: os.fchown(lf.fileno(), U.pw_uid, U.pw_gid)   # the canary-owned processes reopen it
+        subprocess.run(pre + argv, stdin=subprocess.DEVNULL, stdout=lf, stderr=lf, env=ENV, check=True, cwd="/")
+
+def alive(pidfile, name):
+    try:
+        pid = int(open(pidfile).read().split()[0])
+        return pid if open(f"/proc/{pid}/comm").read().strip().startswith(name) else None
+    except (OSError, ValueError, IndexError): return None
+
+def up():
+    for d in (RUN, LOGDIR):
+        os.makedirs(d, exist_ok=True)
+        if os.getuid() == 0: os.chown(d, U.pw_uid, U.pw_gid)
+    with open(EVENTS, "a"): pass        # canary must own the event log before root's reset appends to it
+    if os.getuid() == 0: os.chown(EVENTS, U.pw_uid, U.pw_gid)
+    cfg = f"{RUN}/haproxy.cfg"; shutil.copyfile(f"{HERE}/haproxy.cfg", cfg)
+    if os.getuid() == 0: os.chown(cfg, U.pw_uid, U.pw_gid)
+    if not alive(f"{RUN}/haproxy.pid", "haproxy"):
+        if os.path.exists(HAP_SOCK): os.unlink(HAP_SOCK)
+        launch(["haproxy", "-D", "-f", cfg, "-p", f"{RUN}/haproxy.pid"], f"{LOGDIR}/haproxy.out")
+        for _ in range(50):
+            if os.path.exists(HAP_SOCK): break
+            time.sleep(0.1)
+        else: sys.exit("canaryctl: haproxy did not come up")
+    if not alive(f"{RUN}/engine.pid", "python"):
+        set_weights(100, 0)
+        if not os.path.exists(STATUS): idle()
+
+def idle():
+    write_status({"rollout_id": None, "state": "idle", "stage": None, "weights": {"app-blue": 100, "app-green": 0},
+                  "pid": None, "window": None, "abort_reason": None})
+    if os.getuid() == 0: os.chown(STATUS, U.pw_uid, U.pw_gid)
+
+def stop_engine():
+    pid = alive(f"{RUN}/engine.pid", "python")
+    if pid:
+        os.kill(pid, signal.SIGTERM)
+        for _ in range(50):
+            if not os.path.exists(f"/proc/{pid}"): break
+            time.sleep(0.1)
+
+def status():
+    try: return json.load(open(STATUS))
+    except OSError: return {"state": "idle"}
+
+ap = argparse.ArgumentParser(prog="canaryctl"); sub = ap.add_subparsers(dest="cmd", required=True)
+sub.add_parser("up"); sub.add_parser("status"); sub.add_parser("reset")
+s = sub.add_parser("start"); s.add_argument("--dwell", type=float, default=30)
+a = ap.parse_args()
+
+if a.cmd == "up": up(); print(json.dumps(status()))
+elif a.cmd == "status": print(json.dumps(status()))
+elif a.cmd == "reset":
+    up(); stop_engine(); set_weights(100, 0); idle(); event({"type": "reset"}); print(json.dumps(status()))
+elif a.cmd == "start":
+    if a.dwell < 10: sys.exit("canaryctl: --dwell must be >= 10 seconds (one full evaluation window)")
+    up(); stop_engine(); set_weights(100, 0)
+    rid = uuid.uuid4().hex[:12]
+    launch(["python3", "-I", f"{HERE}/engine.py", "--dwell", str(a.dwell), "--id", rid], f"{LOGDIR}/engine.out")
+    for _ in range(50):
+        st = status()
+        if st.get("rollout_id") == rid: print(json.dumps(st)); sys.exit(0)
+        time.sleep(0.1)
+    sys.exit("canaryctl: engine did not report within 5 s")
