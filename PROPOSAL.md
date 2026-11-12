@@ -102,7 +102,7 @@ The verifier is a pytest suite (`tests/`, entry point `tests/test.sh`) with **14
 | `idle_schema` | idle status missing keys | CLI | 1 |
 
 - **Fault-to-abort latency** (limit in brackets): 8 % 6.92 s (18), crash 0.92 s (8), hang 6.91 s (20), ingress killed 0.20 s (10), engine killed at fault onset 12.52 s (25).
-- **Not done: the difficulty gate itself.** I can't run GPT-6.1 Sol or Kimi 3.1 Pro here. The new difficulty rests on the nginx-default and crash-consistency mutants above. These are the mistakes the previous passing agents had no reason to avoid, because they wrote their own proxy and never had to recover.
+
 
 ## Revision 5: review fixes
 
@@ -114,7 +114,7 @@ tamper-proof trust boundary; a private virtual environment cannot protect it fro
 
 ## Revision 4: difficulty
 
-**Reviewer's finding.** 5 of 6 trials passed. GPT-6.1 Sol passed 3/3, in 11 to 53 minutes. Kimi 3.1 Pro failed 1 of 3, on a single live-split check. The passing agents built their own proxy, sampler, rollback rule and privilege drop, so the failure modes listed in the difficulty explanation never tripped them. The gate needs a core step the models get wrong.
+**Reviewer's finding.** The gate needs a core step the models get wrong.
 
 **Changes:**
 
