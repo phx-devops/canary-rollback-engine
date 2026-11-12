@@ -19,9 +19,11 @@ def variant(base, **kw): d = json.loads(json.dumps(base)); d.update(kw); return 
     GOOD_IDLE, GOOD_SHIFTING,
     variant(GOOD_SHIFTING, extra_key="allowed"),
     variant(GOOD_SHIFTING, state="promoted", stage=3, weights=H.GREEN),
+    variant(GOOD_SHIFTING, state="promoted", stage=3, weights=H.GREEN, pid=None),
     variant(GOOD_SHIFTING, state="aborted", weights=H.BLUE, abort_reason="green 8%"),
+    variant(GOOD_SHIFTING, state="aborted", weights=H.BLUE, pid=None, abort_reason="green 8%"),
     variant(GOOD_SHIFTING, window={"seconds": 10, "green_requests": 0, "green_errors": 0, "error_rate": None}),
-], ids=["idle", "shifting", "extra-key", "promoted", "aborted", "empty-window"])
+], ids=["idle", "shifting", "extra-key", "promoted", "promoted-null-pid", "aborted", "aborted-null-pid", "empty-window"])
 def test_status_schema_accepts(s):
     assert H.status_problem(s) is None
 
@@ -29,6 +31,10 @@ def test_status_schema_accepts(s):
 @pytest.mark.parametrize("s", [
     {k: v for k, v in GOOD_IDLE.items() if k != "pid"},                       # key missing
     variant(GOOD_IDLE, weights=H.GREEN),                                      # idle not on blue
+    variant(GOOD_IDLE, rollout_id="r1"),                                     # idle with rollout ID
+    variant(GOOD_IDLE, stage=1),                                             # idle with stage
+    variant(GOOD_IDLE, pid=42),                                              # idle with PID
+    variant(GOOD_IDLE, window={"seconds": 10, "green_requests": 0, "green_errors": 0, "error_rate": None}),
     variant(GOOD_SHIFTING, state="rolling"),                                  # unknown state
     variant(GOOD_SHIFTING, weights={"app-blue": 90, "app-green": 10}),        # weights disagree with stage
     variant(GOOD_SHIFTING, weights={"blue": 50, "green": 50}),                # wrong weight keys
@@ -43,7 +49,8 @@ def test_status_schema_accepts(s):
     variant(GOOD_SHIFTING, state="aborted", weights={"app-blue": 50, "app-green": 50}, abort_reason="x"),
     variant(GOOD_SHIFTING, state="promoted", stage=2, weights=H.GREEN),
     [],
-], ids=["missing-key", "idle-green", "bad-state", "stage-mismatch", "weight-keys", "stage-4", "stage-bool", "pid-str",
+], ids=["missing-key", "idle-green", "idle-rollout-id", "idle-stage", "idle-pid", "idle-window",
+        "bad-state", "stage-mismatch", "weight-keys", "stage-4", "stage-bool", "pid-str",
         "empty-rid", "float-count", "no-window", "reason-while-shifting", "abort-no-reason", "abort-not-blue",
         "promoted-stage-2", "not-object"])
 def test_status_schema_rejects(s):
@@ -151,3 +158,66 @@ def test_terminal_and_cadence_checks():
 def test_other_rollouts_are_ignored():
     lines = promoted_log() + [sample(100, 50, 50, rid="other")]
     assert H.rule_problems(mine(lines)) == []
+
+
+# ---------------------------------------------------------------- revision 4: fix 4 and recovery
+def test_pid_null_allowed_once_rollout_ended():                      # reviewer's fix 4
+    for st, w in (("aborted", H.BLUE), ("promoted", H.GREEN)):
+        s = variant(GOOD_SHIFTING, state=st, weights=w, pid=None, stage=3,
+                    abort_reason="x" if st == "aborted" else None)
+        assert H.status_problem(s) is None, H.status_problem(s)
+
+
+def test_pid_required_while_shifting():
+    assert H.status_problem(variant(GOOD_SHIFTING, pid=None)) is not None
+
+
+def resumed(ts, k, rid="r1"): return ev(ts, "resumed", rollout_id=rid, stage=k)
+
+
+def test_resumed_starts_a_fresh_window():
+    # four healthy samples, restart, one sample, then a stage change: the window behind it has 1 sample
+    lines = [stage(0, 1)] + [sample(2 * i, 30) for i in range(1, 5)] + [resumed(12, 1), sample(14, 30), stage(14, 2)]
+    assert any("decided on window" in p for p in H.rule_problems(mine(lines)))
+    ok = [stage(0, 1)] + [sample(2 * i, 30) for i in range(1, 5)] + [resumed(12, 1)] + \
+         [sample(12 + 2 * i, 30) for i in range(1, 6)] + [stage(22, 2)]
+    assert H.rule_problems(mine(ok)) == []
+
+
+def test_decision_must_directly_follow_its_sample():
+    good = [stage(0, 1)] + [sample(2 * i, 30) for i in range(1, 6)] + [stage(10, 2)]
+    assert H.rule_problems(mine(good)) == []
+    late = [stage(0, 1)] + [sample(2 * i, 30) for i in range(1, 6)] + [resumed(11, 1), stage(11, 2)]
+    assert any("does not directly follow" in p for p in H.rule_problems(mine(late)))
+
+
+def test_recovered_decision_placed_before_resumed_is_valid():
+    """A decision persisted just before a crash and logged during recovery sits after its sample."""
+    lines = [stage(0, 1)] + [sample(2 * i, 30) for i in range(1, 6)] + [stage(13, 2), resumed(13, 2)]
+    m = mine(lines)
+    assert H.rule_problems(m) == [] and H.terminal_problem(m + [], "promoted") is not None   # not finished, but consistent
+
+
+def test_breach_before_a_crash_must_still_abort():
+    lines = [stage(0, 1)] + [sample(2 * i, 20, 2) for i in range(1, 6)] + [resumed(12, 1)]
+    assert any("not acted on" in p for p in H.rule_problems(mine(lines)))
+
+
+def test_cadence_ignores_gaps_across_restarts():
+    lines = [stage(0, 1)] + [sample(2 * i, 30) for i in range(1, 5)] + [resumed(20, 1)] + \
+            [sample(20 + 2 * i, 30) for i in range(1, 5)]
+    assert H.cadence_problem(mine(lines)) is None
+    broken = [stage(0, 1)] + [sample(2 * i, 30) for i in range(1, 5)] + [sample(20 + 2 * i, 30) for i in range(1, 5)]
+    assert H.cadence_problem(mine(broken)) is not None
+
+
+def test_terminal_flags_duplicate_stage_and_wrong_resumed_stage():
+    dup = [stage(0, 1)] + [sample(2 * i, 30) for i in range(1, 6)] + [stage(10, 2), resumed(11, 2), stage(11, 2)]
+    assert H.terminal_problem(mine(dup), "promoted")
+    wrong = [stage(0, 1), sample(2, 30), resumed(3, 2)]
+    assert "resumed at stage" in (H.terminal_problem(mine(wrong), "promoted") or "")
+
+
+def test_resumed_event_schema():
+    assert H.parse_events([ev(1, "resumed", rollout_id="r1")])[1]
+    assert not H.parse_events([resumed(1, 2)])[1]

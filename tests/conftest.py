@@ -14,7 +14,7 @@ if os.environ.get("CANARY_SELFTEST") != "1":
     except OSError: EVENTS_OFFSET = 0
 
 PROMOTE = ["healthy", "green3", "blue30", "bursty"]
-ABORT = ["green8", "crash", "hang", "proxykill"]
+ABORT = ["green8", "crash", "hang", "proxykill", "killfault"]
 
 _cache = {}
 
@@ -26,6 +26,9 @@ def scenario():
             if name in PROMOTE: _cache[name] = S.run_promote(name, EVENTS_OFFSET)
             elif name in ABORT: _cache[name] = S.run_abort(name, EVENTS_OFFSET)
             elif name == "notraffic": _cache[name] = S.run_notraffic(EVENTS_OFFSET)
+            elif name == "chaos": _cache[name] = S.run_chaos(EVENTS_OFFSET)
+            elif name == "abortreboot": _cache[name] = S.run_abort_reboot(EVENTS_OFFSET)
+            elif name == "ingress": _cache[name] = S.run_ingress_check(EVENTS_OFFSET)
             else: raise KeyError(name)
         return _cache[name]
     return get

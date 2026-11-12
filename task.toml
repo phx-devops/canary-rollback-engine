@@ -5,15 +5,16 @@ author_name = "Andy (Phoenix DevOps)"
 difficulty = "hard"
 category = "systems"
 subcategory = "systems"
-tags = ["canary", "progressive-delivery", "haproxy", "network-namespaces", "observability", "rollback"]
-expert_time_estimate_min = 150
-junior_time_estimate_min = 600
+tags = ["canary", "progressive-delivery", "nginx", "crash-recovery", "network-namespaces", "observability", "rollback"]
+expert_time_estimate_min = 240
+junior_time_estimate_min = 900
 
 [verifier]
-timeout_sec = 900
+# The verifier runs in the agent's root-capable container; this is not an isolation boundary.
+timeout_sec = 1800
 
 [agent]
-timeout_sec = 7200
+timeout_sec = 28800
 
 [environment]
 build_timeout_sec = 900

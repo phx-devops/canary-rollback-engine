@@ -50,6 +50,18 @@ def test_all_traffic_on_green_after_promotion(scenario, name):
     assert H.green_share(after) == 1.0, f"green share {H.green_share(after)}"
 
 
+def test_up_preserves_promoted_state_and_green_traffic(scenario):
+    r = scenario("healthy")
+    assert r["term"] == "promoted", r["final_status"]
+    up = r["up_after_promotion"]
+    status = up["out"]
+    assert up["rc"] == 0, up["stderr"]
+    assert status["state"] == "promoted" and status["rollout_id"] == r["start"]["rid"], status
+    assert status["weights"] == H.GREEN
+    after_up = [item for item in r["rec"] if up["t_done"] <= item[0] < up["t_done"] + 2]
+    assert after_up and all(item[2] == 200 and item[3] == "app-green" for item in after_up)
+
+
 def test_healthy_rollout_has_no_client_errors(scenario):
     bad = [x for x in scenario("healthy")["rec"] if x[2] != 200]
     assert not bad, f"{len(bad)} failed client requests, e.g. {bad[:3]}"

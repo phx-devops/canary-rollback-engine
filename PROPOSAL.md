@@ -1,133 +1,143 @@
 # Task proposal: Automated canary deployment and rollback engine
 
 **Author:** Andy (Phoenix DevOps)
-**Domain / subdomain:** Systems / Systems. The task covers ingress traffic management, telemetry-driven control loops, and Linux process isolation (network namespaces, privilege and capability dropping, daemonisation).
-**Difficulty:** Hard. About 2.5 h for an expert and about 10 h for a junior engineer.
+**Domain / subdomain:** Systems / Systems. The task covers ingress traffic management with nginx, telemetry-driven control loops, crash-consistent controllers, and Linux process isolation (network namespaces, privilege dropping, daemonisation).
+**Difficulty:** Hard. About 4 h for an expert and about 15 h for a junior engineer.
 **Task ID:** `canary-rollback-engine`
-**Revision:** 3. Revision 2 responded to the TB3 review (decision: Accept; "well-specified" marked Uncertain); see [Response to the review](#response-to-the-review). Revision 3 replaces the golden solution with a Go proxy plus Python controller, following an external frontier run, and fixes three deployment bugs and one test-timing weakness that the rebuild exposed (see [Revision 3](#revision-3-go-golden-solution)).
+**Revision:** 5. This revision incorporates reviewer feedback on the runtime image, Compose service, verifier coverage, and reward reporting. See [Revision 5](#revision-5-review-fixes).
 
 ## What the agent is asked for
 
-Two versions of a service, `app-blue` (v1.0) and `app-green` (v2.0), are already running inside the network namespace `/run/netns/canary`. The agent builds a toolchain in Python, Go or Bash with these parts:
+Two versions of a service, `app-blue` (v1.0) and `app-green` (v2.0), are already running inside the network namespace `/run/netns/canary`. The agent builds a toolchain (Python, Go or Bash) with these parts:
 
-- **An ingress proxy** on `127.0.0.1:8080` inside the namespace. The agent manages it, and it splits traffic between the two targets.
-- **Stages.** The engine shifts traffic **90/10 → 50/50 → 0/100**. Each stage is held for a dwell time, including 0/100, before the rollout is promoted.
-- **Telemetry.** Every **2 seconds** the engine takes a sample from the proxy's access logs or metrics. It evaluates app-green's error rate over the last **10 seconds** (five samples), once there are at least 20 green requests in that window.
-- **Rollback.** If that rate is **above 5 %**, the engine immediately moves 100 % of traffic back to `app-blue`, and the abort sticks. It also aborts to blue if the proxy itself dies.
+- **nginx as the ingress.** The ingress is the platform's standard proxy: the installed **nginx**, run and configured by the agent's toolchain on `127.0.0.1:8080`. It connects to the targets directly. No custom proxy may listen on `:8080`, and nothing may sit between nginx and the targets.
+- **Stages.** The engine shifts traffic **90/10 → 50/50 → 0/100**, holding each stage for a dwell time, including a final bake at 0/100.
+- **Only the engine changes the split.** The split must match the stage at all times, including while green is failing.
+- **Telemetry.** Every **2 seconds** the engine samples nginx's access log. It evaluates green's error rate over the last **10 seconds**, once there are at least 20 green requests in that window.
+- **Rollback.** If that rate is **above 5 %**, the engine immediately moves 100 % of traffic back to blue, and the abort sticks.
+- **Crash and reboot recovery.** The engine can be SIGKILLed at any moment, and the node can reboot. A reboot kills every `canary` process and loses `/run` and `/tmp`. After the node agent runs `canaryctl up`:
+  - a rollout in progress continues under the same ID, at the current stage's split;
+  - an aborted rollout stays aborted, and a promoted one stays promoted;
+  - every decision appears in the log exactly once.
 - **Isolation.** Everything runs **unprivileged and detached inside the namespace**, even though the operator starts it as root from the default namespace.
 
-The instruction defines every quantity and every file the verifier reads:
-
-- the error-rate formula, the 20-request minimum and the failure definition;
-- the decision order after each sample;
-- the full status-file schema, keyed by state;
-- the event-log schema, with the required fields per event type;
-- the exact `/proc` fields used for the isolation checks.
-
-It does not name a proxy, proxy directives, telemetry plumbing or a privilege-dropping mechanism.
+The instruction defines every quantity and every file the verifier reads: the error-rate formula, the failure definition, the decision procedure, the recovery outcomes, the status and event schemas (including a new `resumed` event), and the exact `/proc` fields. It does not name nginx directives, a state format or a privilege-dropping method.
 
 ## Why it is hard
 
-1. **The rolling window has to be computed correctly.** The error rate is summed failures divided by summed requests. Averaging each 2-second sample's percentage is the natural shortcut, and under bursty traffic it aborts healthy rollouts.
-2. **Errors must be attributed to app-green.** Counting every 5xx at the ingress makes app-blue's errors abort the rollout. Counting only 5xx responses misses green failures that the proxy generates (connection refused, upstream timeout), which is how crashes and hangs show up.
-3. **Proxy defaults hide failures.** HAProxy's retries and redispatch, or nginx's `proxy_next_upstream`, quietly resend failed green requests to blue. Clients see 200s and the telemetry never sees the crash. A default upstream timeout of 30–60 s makes a hung green invisible past the deadline.
-4. **Weights must change live.** Reloading or restarting the proxy to change weights drops requests and resets counters, and the healthy run allows zero client errors.
-5. **No decision without evidence.** With no traffic, 0/0 must not count as healthy.
-6. **The proxy is a failure point too.** If the proxy dies mid-rollout, an engine that only reads telemetry sees an empty window and waits forever while clients get errors.
-7. **Root starts it, but it must end up unprivileged in the namespace.** The end state is fully specified, so this is not a hunt for a specific syscall sequence: any mechanism that produces the state passes. Getting there still means entering the namespace while privileged and dropping identity and capabilities in a valid order, which the common tools (`ip netns exec`, `sudo -u`, `su`, `runuser`) don't do by default.
-8. **The time limits are tight.** A crash must be rolled back within 8 s, 8 % errors within 18 s, a hang within 20 s, and a dead proxy within 10 s.
+**The core step the models get wrong: making nginx tell the truth about a failing canary.** Previously an agent could write its own proxy, and every passing trial did exactly that, so none of the proxy traps applied. With nginx required, a correct-looking configuration fails, and fails silently. nginx's defaults are built to *protect users from a bad upstream*, which is the opposite of what a canary analysis needs. Three defaults each defeat a requirement:
+
+1. **Passive health checking (`max_fails=1`, `fail_timeout=10s`).** After one connection error or timeout, nginx pulls app-green out of rotation for 10 s. When green crashes, it gets one failed request every 10 s, so the window never holds 20 requests and the rate is never evaluated. The rollout never aborts, and clients are quietly served by blue. Nothing in the config mentions this behaviour; it is a default.
+2. **Retry on the next upstream (`proxy_next_upstream error timeout`).** A refused green request is resent to blue. The client gets a 200, and the access log line names two upstreams (`127.0.0.1:9002, 127.0.0.1:9001`). Naive parsers drop or misattribute the line.
+3. **60 s upstream timeout.** A hung green produces nothing for a minute.
+
+Other nginx details the agent must handle:
+- **Zero weights.** `weight=0` is invalid in nginx, so 100/0 and 0/100 need `down`.
+- **Live split changes.** Changing the split means a graceful reload.
+- **Running unprivileged.** nginx defaults to root-owned temp, log and pid paths, so it has to be relocated to run as `canary`.
+
+**The second core step: crash consistency.** A controller that keeps its rollout state in memory, or writes state *after* acting, breaks under kill and reboot, and the verifier now does both:
+- **Rollout lost or regressed.** State kept in `/run` or `/tmp` is lost on reboot, so `up` restarts from idle or 100 % blue.
+- **Abort undone.** An abort applied to nginx but not persisted resumes the rollout after a reboot, sending traffic to the bad canary.
+- **Decision logged twice or not at all.** A decision persisted but not logged is lost from the log, and a recovered decision logged in the wrong place breaks the decision order.
+- **Stale window.** A resumed engine that judges with a stale or half-empty window makes a decision on no evidence.
+- **"Safe default" restart.** An `up` that starts nginx at 100 % blue on reboot flips live traffic back to blue mid-rollout.
+
+**Kept from earlier revisions:**
+- rolling-window maths (ratio of sums, not the mean of per-sample rates);
+- attributing failures to green rather than blue;
+- no decision without evidence (0/0 is not healthy);
+- the ingress-death watchdog;
+- the isolation end state.
 
 ## How it is verified
 
-The verifier is a pytest suite (`tests/`, entry point `tests/test.sh`) with **110 named tests** over nine scenarios. It runs as root **inside the namespace** as a load generator. It sends 60 rps with a new connection per request and records which target answered each one. It drives fault injection through the apps' **root-only admin sockets** and reads the apps' own request counters as ground truth. The status file and event log are checked against their schemas and against that ground truth, never trusted on their own. The reward is 1 only if every test passes. The suite's own checkers are covered by 42 self-tests, and a mutation runner proves that nine broken engines each fail (see Validation done).
+The verifier is a pytest suite (`tests/`, entry point `tests/test.sh`) with **146 named tests** over thirteen scenarios. It runs as root **inside the namespace** as a load generator: 60 rps, a new connection per request, recording which target answered each one. Fault injection and ground-truth request counters go through the apps' **root-only admin sockets**. The status file and event log are checked against their schemas and against that ground truth. The verifier also recomputes every decision from the engine's own samples, starting a fresh window at each `resumed` event. The reward is 1 only if every test passes.
 
 | Scenario | Must happen |
 |---|---|
-| Healthy rollout | Promoted. Stages in order, each held at least the dwell time. Measured green share within ±5 pp of 10/50/100 at every stage. **Zero** failed client requests. The engine's sample total matches app-green's own counter within 5 %. |
-| app-green fails 3 % of requests | Promoted (no false abort). |
-| app-blue fails 30 % of requests, green healthy | Promoted (attribution). |
-| Bursty traffic: 4 s at 10 rps with green failing 40 %, then 6 s at 200 rps clean | Promoted. The correct ratio is about 1–2 %, while averaging per-sample percentages gives more than 5 % at every sampling alignment. |
-| No traffic for 2 × dwell, then traffic | Holds at stage 1, then promotes. |
-| app-green 8 % errors at 50/50 | Aborted within 18 s. |
-| app-green crashes at 90/10, once the 10 s window is full | Aborted within 8 s. |
-| app-green hangs (accepts, never answers) during the 0/100 bake | Aborted within 20 s. |
-| Ingress proxy SIGKILLed at 50/50 | Aborted within 10 s. From kill + 10 s, every request is a 200 from app-blue. |
-| After every abort | Requests sent from abort time + 1 s are all 200s from blue. app-green's counter is frozen from + 2 s, including after green recovers. In-flight requests may finish either way. |
-| Every status poll (every 0.2 s) | The full schema holds, and weights match the state and stage. |
-| Event log of every rollout | Well-formed per schema. 2-second sample cadence. One terminal event of the expected kind. **Each stage change, promotion and abort recomputed from the engine's own samples follows the rule**, and the engine never ignores a breach. |
-| Isolation, checked on every process in the namespace except the two targets | All four `Uid`/`Gid` values are `canary`. `Groups` ⊆ {canary}. CapInh/Prm/Eff/Amb = 0. `tty_nr = 0`. Session differs from the verifier's. The set must include the `:8080` listener and, while shifting, the engine pid. Checked during a healthy rollout and again after the proxy has been restarted. No file capabilities; no setuid/setgid files under `/opt/canary`. |
-| CLI | `up` is idempotent. `reset` prints a schema-valid idle status. `start` prints the new rollout (state `shifting`, new `rollout_id`) within 5 s. `--dwell 5` is rejected. The final state is the ingress up at 100 % blue. |
+| Healthy rollout | Promoted. Stages in order, each held at least the dwell time. Green share within ±5 pp of 10/50/100 at every stage. **Zero** failed client requests. Sample totals match app-green's own counter within 5 %. |
+| Green 3 % / blue 30 % errors / bursty traffic | Promoted, with the split checked at every stage. |
+| No traffic, then traffic | Holds at stage 1, then promotes. |
+| Green 8 % errors at 50/50 | Aborted within 18 s, without advancing. **The split must stay at 50/50 while green is failing**, before the abort. |
+| Green crashes at 50/50 (window mostly stage-2 traffic) | Aborted within 8 s, **without advancing**. Under nginx's default `max_fails`, green is pulled from rotation and the window looks healthy, so the engine advances the dead canary to 0/100. Under its default retry, the failures land on blue. |
+| Green hangs during the 0/100 bake | Aborted within 20 s. Fails under the default 60 s timeout. |
+| Ingress SIGKILLed at 50/50 while the engine runs | Aborted within 10 s; serves 100 % blue again. |
+| **Engine killed the moment green starts failing**; `up` after 2 s | Resumed (`resumed` logged), then aborted within 25 s of the fault, without advancing. |
+| **Chaos:** healthy rollout, engine SIGKILLed 3 times (once right after a stage change) plus one reboot at 50/50, each followed by `up` | Promoted under the same `rollout_id`. Every `up` prints `shifting` with a live engine pid. The split is correct at every stage and back at 50/50 within 5 s of the post-reboot `up`. No client errors outside the reboot outage. Exactly 4 `resumed` events, each stage logged exactly once, and every decision consistent with its own window. |
+| **Abort, then reboot** | `up` reports `aborted`, 100 % blue. Green gets nothing, even though it now looks healthy. The abort is logged exactly once. |
+| **Ingress identity** (before and after a reboot) | With upstream connections held open, the `:8080` listeners and every process connected to a target are `/usr/sbin/nginx`. |
+| After every abort | Requests sent from abort + 1 s are all 200s from blue. Green's counter is frozen from + 2 s, even after it recovers. |
+| Every status poll, every event line | Schema-valid (status may be absent only during a reboot). Decisions directly follow their triggering sample. |
+| Isolation (mid-rollout, after the ingress restart, after a reboot) | Every non-target process in the netns: all UIDs/GIDs `canary`, groups ⊆ {canary}, CapInh/Prm/Eff/Amb = 0, no TTY, its own session. No file capabilities; no setuid/setgid files under `/opt/canary`. |
+| CLI | `up` is idempotent, `reset` prints an idle status, `start` returns within 5 s, `--dwell 5` is rejected, and the final state is 100 % blue and idle. |
 
-**Ways to game the checks are closed off:**
-
-- Fault control and ground-truth counters sit behind root-only sockets.
-- Client-side routing is observed directly.
-- The engine's reported counts must match app-green's own counter.
-- Its decisions must be consistent with its own samples, so a fabricated log fails.
-- Only event lines written during grading are judged, so leftovers from the agent's development runs don't count against it.
-
-**Fault injection is deterministic.** "8 %" means exactly 8 of every 100 requests, evenly spaced. In simulation, random 3 % faults crossed the 5 % threshold through binomial noise in 7 of 60 runs; deterministic faults crossed it in 0 of 160. The latency limits are the simulated worst case (4.0 s for a crash, 10.7 s for 8 %) plus margin.
+**A reboot is simulated faithfully:**
+- every `canary` process is SIGKILLed;
+- every entry in `/run` and `/tmp` that was not there at container start is deleted (the entrypoint records a baseline);
+- `/var/lib`, `/var/log` and `/opt` survive.
 
 ## Validation done
 
-- **The golden solution passes all 110 tests** (reward 1), including the five isolation tests, on Ubuntu 24.04 with a real named network namespace. It is a static Go proxy plus a Python controller (GOLDEN_SOLUTION.md). The full run takes about 8.5 minutes. The previous HAProxy-based golden is kept in `solution/alternatives/haproxy/` and passes too, which shows the verifier doesn't depend on a particular proxy.
-- **The verifier's own checkers pass 42 self-tests.** These are hand-built good and bad statuses and event logs: each status-schema violation, each malformed event, a decision on an unevaluated window, an ignored breach, a mislogged abort, and a mean-of-ratios abort.
-- **Nine deliberately broken engines are each caught** by `tests/mutants/run_mutants.sh`. It installs each one (rebuilding the Go proxy from patched source where needed) and runs only its targeted tests:
+- The prior revision's golden solution passed **144 tests** (reward 1, 11 min 49 s) on Ubuntu 24.04 with nginx 1.24 (`nginx-light`, as in the image) and a real network namespace. The current revision adds integration and schema coverage that must be rerun before claiming a pass.
+- The verifier's pure self-tests passed **57 tests** after adding strict idle-state validation and terminal `pid: null` cases. The full runtime suite still needs to be rerun for this revision.
+- **Fifteen deliberately broken engines are each caught** by `tests/mutants/run_mutants.sh`:
 
-| Mutant | Scenario | Result |
-|---|---|---|
-| Mean of per-sample percentages | bursty | Aborted a healthy rollout whose true window ratio was 1.29 % |
-| Counts every backend's 5xx | blue 30 % | Aborted at stage 1 |
-| Treats an empty window as healthy | no traffic | Promoted to 0/100 with zero traffic |
-| Proxy upstream timeout of 60 s (Go proxy flag) | hang | Never aborted |
-| Proxy retries a failed green request on blue (Go source patch) | crash | Never aborted; clients saw 200s |
-| No proxy liveness check | proxy killed | Never aborted; clients got errors |
-| Aborts to 99/1 instead of 100/0 | green 8 % | app-green kept receiving traffic after the abort |
-| Enters the netns but never drops root | mid-rollout isolation | Toolchain processes ran as root with capabilities |
-| Idle status missing schema keys | CLI | `reset` status failed the schema |
+| Mutant | Defect | Target | Tests failed |
+|---|---|---|---|
+| `mean_of_ratios` | mean of per-sample rates | bursty | 8: aborted a healthy rollout |
+| `all_5xx` | counts blue's 5xx as green's | blue 30 % | 7: aborted at stage 1 |
+| `empty_is_healthy` | 0/0 treated as healthy | no traffic | 2: advanced with no evidence |
+| `drain_not_zero` | aborts to 99/1 | green 8 % | 2: green kept getting traffic |
+| `no_watchdog` | no ingress liveness check | ingress killed | 5: never aborted |
+| **`nginx_max_fails`** | nginx default passive health check | crash | 2: **advanced the dead canary to 0/100**; abort 8.9 s (> 8) |
+| **`nginx_next_upstream`** | nginx default retry to the other upstream | crash | 2: failures hidden on blue; advanced; deadline missed |
+| **`nginx_read_timeout`** | nginx default 60 s upstream timeout | hang | 5: never aborted in time |
+| **`up_always_blue`** | `up` restarts nginx at "safe" 100 % blue | chaos | 8 |
+| **`no_resume`** | `up` doesn't restart the engine | chaos | 8: rollout stalled |
+| **`abort_not_durable`** | abort applied but not persisted | abort + reboot | 2: rollout resumed after the reboot |
+| **`state_in_run`** | rollout state kept under `/run` | chaos | 8: reboot lost the rollout |
+| **`no_resumed_event`** | no `resumed` event on restart | chaos | 1 |
+| `root_engine` | enters the netns but never drops root | isolation | 1 |
+| `idle_schema` | idle status missing keys | CLI | 1 |
 
-- **Measured fault-to-abort latency** (limit in brackets): 8 % errors 6.95 s (18), crash 0.97 s (8), hang 6.97 s (20), proxy killed 0.16 s (10).
-- Not yet done: a **blind** frontier-agent run (instruction and environment only) inside the built image. The one external run so far doesn't count; see below.
+- **Fault-to-abort latency** (limit in brackets): 8 % 6.92 s (18), crash 0.92 s (8), hang 6.91 s (20), ingress killed 0.20 s (10), engine killed at fault onset 12.52 s (25).
+- **Not done: the difficulty gate itself.** I can't run GPT-6.1 Sol or Kimi 3.1 Pro here. The new difficulty rests on the nginx-default and crash-consistency mutants above. These are the mistakes the previous passing agents had no reason to avoid, because they wrote their own proxy and never had to recover.
 
-## Revision 3: Go golden solution
+## Revision 5: review fixes
 
-**The external frontier run.** A frontier agent built a Go proxy plus a Python controller and passed 105 of 110 tests in a non-root sandbox. It couldn't run the 5 isolation tests there. Its abort latencies were 6.92 s for 8 % errors, 6.95 s for a crash, 6.96 s for a hang and 0.15 s for proxy death. **This is not a difficulty measurement**, because its input included the verifier suite and our previous golden solution. It does show that writing your own proxy is a natural route, so the golden now takes that route and the suite has been checked against it.
+The current revision applies the feedback on Compose wiring and privilege inspection, explicit
+entrypoint permissions, CA certificates, startup/runtime descriptions, timeout configuration,
+reward initialization, idle schema validation, active-rollout replacement/reset, and promotion
+recovery. The verifier still shares a root-capable container with the agent, so it is not a
+tamper-proof trust boundary; a private virtual environment cannot protect it from a root agent.
 
-**What rebuilding the golden that way exposed.** These problems were hidden in the authoring sandbox but would have appeared in a freshly built image:
+## Revision 4: difficulty
 
-1. **Event-log ownership (affected both goldens).** On a fresh container, root's `canaryctl reset` created `/var/log/canary/events.jsonl` owned by root, so the engine (running as `canary`) couldn't write to it and died on start. The old HAProxy runs had only passed because a canary-owned file was left over from development. `canaryctl` now creates the file as canary's before anything appends to it, and repairs it if it's root-owned.
-2. **Launcher log ownership.** Log files that root's launcher opened stayed root-owned, so the engine couldn't reopen `proxy.out` when it restarted a dead proxy. The launcher now hands them to `canary`.
-3. **Zombie proxies.** A SIGKILLed proxy lingers as a zombie until PID 1 reaps it. The entrypoint's `sleep infinity` never reaps, so a liveness check based on `/proc/<pid>/comm` saw it as alive forever. Liveness now treats zombies as dead, and the compose file sets `init: true` so orphans are reaped.
-4. **Crash test timing.** Both implementations aborted all three app faults at almost exactly 7 s. For the crash, that was the rule rather than the engine: the fault was injected 3 s into stage 1, before the first five-sample window existed (at 10 s), so every correct engine had to wait. The crash is now injected 11 s into stage 1, with the window full and the rollout still at 90/10. The test now measures detection speed, and the golden aborts in about 1 s.
-5. **Stand-in app fidelity.** A simulated crash closed only the listener, so a proxy reusing pooled connections could keep getting answers from a "crashed" green. The app now drops every open connection on crash, as a real crash would. This possibly contributed to the external run's slow crash abort (6.95 s against an 8 s limit).
+**Reviewer's finding.** 5 of 6 trials passed. GPT-6.1 Sol passed 3/3, in 11 to 53 minutes. Kimi 3.1 Pro failed 1 of 3, on a single live-split check. The passing agents built their own proxy, sampler, rollback rule and privilege drop, so the failure modes listed in the difficulty explanation never tripped them. The gate needs a core step the models get wrong.
 
-## Response to the review
+**Changes:**
 
-| Review point | Change in this revision |
-|---|---|
-| *Well-specified:* event-log format not given | `instruction.md` now has an event table: required types (`sample`, `stage`, `aborted`, `promoted`), required fields and meanings, ordering (a decision follows the sample that triggered it), and how the tests use it. Unknown types are allowed. |
-| *Well-specified:* status-file format not given | Full schema table: every key always present, types, null rules, and `weights` pinned per state (100/0 idle or aborted, the stage's split while shifting, 0/100 promoted). It is validated on every 0.2 s poll. |
-| *Well-specified:* exact fields the verifier checks are not stated | The instruction states which file fields and which `/proc/<pid>/status`, `ns/net` and `stat` fields are read. It also says what is *not* checked (bounding set, `NoNewPrivs`). "How it will be checked" spells out abort-time measurement, the in-flight grace and the counter-freeze window. |
-| *Well-specified:* namespace setup described conditionally | The fallback is removed. The environment always creates `/run/netns/canary` with loopback up, and the task container is always granted `NET_ADMIN` + `SYS_ADMIN` (in `docker-compose.yaml`). The instruction states this as a fact. |
-| *Well-specified:* unclear whether the agent knows the 20-request minimum | It was always in `instruction.md`. "Not in the brief" in v1 meant *my original one-paragraph brief*, not the agent's instruction, and that wording is gone. The rule is now part of a numbered decision procedure that runs after each sample. |
-| *Well-specified:* privilege requirements stated at a high level | They are now a precise list of the `/proc` values the tests read, applied to *every* non-target process in the namespace. Any mechanism is accepted. |
-| *Verifiable:* how "no traffic after abort" is told apart from in-flight requests | Defined in the instruction and implemented: the abort time is the first poll showing `aborted`. Client requests sent at abort time + 1 s or later must all be served by blue, and green's own counter must not grow from abort time + 2 s. Requests in flight at the abort are exempt. |
-| *Verifiable:* how the event log is validated | Schema validation on every line written during grading, plus a recomputation check: the verifier applies the rollback rule to the engine's own `sample` events and confirms each decision and the logged abort totals. |
-| *Verifiable:* proxy crashing mid-stage not addressed | New requirement and scenario: the proxy is SIGKILLed at 50/50. The engine must abort and have it serving 100 % blue within 10 s, still unprivileged. A mutant without a liveness check fails. |
-| *Solvable:* "no reference implementation is provided" | There is one (`solution/`, documented in GOLDEN_SOLUTION.md), and it passes the full verifier. That is now stated at the top of the validation section. |
-| *Difficult:* privilege dropping is "trick-question-adjacent" | The checks describe an end state, not a recipe. `setpriv`, `capsh`, Python's `os.setns` + `os.setresgid`/`setgroups`/`setresuid`, or Go with `unix.Setns` + `syscall.Setresuid` on a locked thread all pass. The hard part of the task is elsewhere: telemetry correctness and attribution, which six mutants show are what break plausible implementations. |
-| *Outcome-verified:* process-property checks | The brief's own requirement is "run unprivileged and detached inside the namespace", and the state of the running processes *is* that outcome. The checks inspect only that end state, never how it was reached. The 2 s cadence check verifies the brief's "every 2 seconds" claim, and the event log is checked for consistency with ground truth rather than for style. |
+1. **nginx is required as the ingress, end to end.** This turns the documented-but-avoidable proxy traps into the core of the task. The verifier checks the binary behind every `:8080` listener and behind every connection to a target, with connections held open so the check is deterministic. That rules out a custom proxy, or a relay hidden behind nginx.
+2. **The split must hold while green fails, and a failing canary must never advance.** The split is now also checked during the 8 % fault. A new test fails any rollout that reaches a later stage after green starts failing. This is what nginx's passive health checking causes: a crashed green looks healthy and gets promoted.
+3. **Crash and reboot recovery with durable decisions.** Three new scenarios: chaos (4 restarts during a healthy rollout), abort-then-reboot, and engine-killed-at-fault-onset. There is also a new `resumed` event, and the verifier's rule check starts a fresh window at each one. The verifier also requires that each decision directly follows its triggering sample, which is what makes "logged exactly once, in the right place" checkable after a crash.
+4. **Terminal PID handling.** `"pid": null` is valid whenever the state is not `shifting`. Only a live pid while shifting is required.
+5. **HAProxy removed from the image.** The instruction names nginx. The previous Go-proxy golden is retired, because a custom proxy is no longer allowed.
+6. **Verifier robustness.** The ingress-ownership check holds upstream connections open (app-blue hangs briefly while idle) instead of racing millisecond-long connections. The verifier timeout is now 1800 s.
+
+**Fairness.** Everything is still specified as an outcome, so the instruction never hints at `max_fails` or `proxy_next_upstream`. Instead it states the property they break: *"Only the engine changes the split ... including while app-green is failing"*, and *"each client request goes to exactly one target"*. An expert who knows nginx, or who tests a crash against their own setup, finds the defaults within minutes. An agent that writes a plausible nginx config and tests only the happy path does not.
 
 ## Interpretations and open points
 
 | Point | Decision | Why / alternative |
 |---|---|---|
-| "Two container targets" | app-blue and app-green are **long-running service processes standing in for the containers**. Each has its own address, user (`apps`), version and response header. | A nested container runtime is what kept the Bazzite task from being validated end to end. With plain processes, every check here runs today. Real sibling containers are possible via Compose `network_mode: service:client` and a shared volume for the admin sockets, with no verifier change. |
-| "Provided network namespace" | Always `/run/netns/canary`, created by the entrypoint. The task container gets `cap_add: [NET_ADMIN, SYS_ADMIN]`. The agent's processes must hold no capabilities. | Gives "inside the namespace" a checkable meaning (a netns inode comparison). |
-| "Exceeds 5 %" | Strictly greater than, on summed failures over summed requests in the last five samples. | The standard reading, stated explicitly. |
-| Minimum sample | At least 20 green requests in the window. | Matches production canary analysers (Flagger, Argo Rollouts, Kayenta). Without it, one early 500 is a 100 % error rate. |
-| What counts as a green failure | A 5xx from green, a refused or reset connection, or no response within 5 s. | Otherwise crashes and hangs, the most common bad-canary failures, produce no green 5xx and can't be tested. |
-| "Reach 0/100 if healthy" | 0/100 is held for a dwell (a bake) and can still roll back. Then the rollout is promoted. | Matches Argo Rollouts and Flagger. |
-| Proxy death | Abort and restore the proxy at 100 % blue rather than resume. | Resuming a rollout without telemetry is unsafe. Aborting is the conservative, testable choice. |
-| "Immediately" | Limits from fault onset: 8 s for a crash, 18 s for 8 %, 20 s for a hang, 10 s for a dead proxy. The crash is injected once the window is full. | An 8 % fault can't push a 10 s window above 5 % before about 6.25 s, and a hang can't show until the 5 s upstream timeout. The limits are the worst case plus margin. |
-| Dwell | Default 30 s, minimum 10 s, tests use 15 s. | Keeps the full verifier run to about 8.5 minutes (measured: 8 min 25 s). |
+| Ingress choice | nginx is required (the platform-standard proxy). | Realistic: organisations standardise their ingress. And it is the only way to make the proxy-default traps unavoidable. HAProxy would work equally well as the mandated proxy if the reviewer prefers it. |
+| "Two container targets" | Long-running service processes standing in for the containers. | Nested container runtimes would make the verifier unrunnable. Compose sibling containers are possible with no verifier change. |
+| "Provided network namespace" | Always `/run/netns/canary`. The container gets `NET_ADMIN` + `SYS_ADMIN` and `init: true`. The agent's processes must hold no capabilities. | A checkable meaning (a netns inode comparison). |
+| Error rate and threshold | Summed failures over summed requests in the last five samples, at least 20 requests, strictly above 5 %. | Standard, and stated explicitly. |
+| Green failure | A 5xx, a refused or reset connection, or no response headers within 5 s. | Covers crashes and hangs, the common bad-canary failures. |
+| Reboot | Every `canary` process is killed. `/run` and `/tmp` revert to their container-start contents. `/var/lib`, `/var/log` and `/opt` survive. | Mirrors a real node restart (tmpfs `/run`). |
+| Dwell across restarts | Measured from stage entry, including downtime. A resumed engine still needs five fresh samples before deciding. | Downtime can't stall a rollout forever, and no decision is ever made on stale evidence. |
+| Proxy death with the engine alive | Abort and restore 100 % blue. After a full reboot, resume instead. | A running engine that loses its ingress can't trust its telemetry; a rebooted node is a clean restart. |
+| "Immediately" | 8 s crash, 18 s 8 %, 20 s hang, 10 s ingress, 25 s engine-killed-at-fault. | Each is the worst case the rule allows plus margin. |
+| Dwell | Default 30 s, minimum 10 s, tests use 15 s. | Full verifier run about 12 minutes (measured: 11 min 49 s). |

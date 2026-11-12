@@ -2,56 +2,72 @@
 
 ## 1. Source of difficulty (one sentence)
 
-The agent must build a progressive-delivery controller whose correctness is all about behaviour under failure. That means windowed error-rate maths, attributing failures to the right target through a proxy that hides them by default, live weight changes, and a launch path that enters a namespace and sheds all privilege and its TTY. Every common shortcut produces a controller that promotes a healthy canary in a demo but misses a crash, misses a hang, or aborts on noise.
+The agent must run a canary rollout through a **mandated nginx ingress whose defaults are designed to hide a failing upstream**, using a controller whose **decisions survive SIGKILL and node reboots exactly once**. A plausible nginx config and an in-memory controller pass the happy path. They then silently never abort a crashed canary, or flip a live rollout back to blue after a reboot, or resume an aborted one.
 
 ## 2. Why does a frontier AI coding agent fail at this?
 
-The happy path is easy and the test that matters is the unhappy path. An agent that brings up HAProxy, flips weights on a timer and greps for ` 5[0-9][0-9] ` in a log will watch a healthy rollout succeed and declare victory. Each of the following is a separate, silent failure, and six of them are confirmed by mutants that fail the real verifier:
+**What changed in revision 4.** In the difficulty-gate trials (revision 3), 5 of 6 frontier runs passed. They built their own proxy, so none of the proxy traps applied, and nothing ever killed their controller. Revision 4 removes both escape routes. nginx is required end to end: the verifier checks the binary behind every `:8080` listener and every connection to a target. The controller is killed and the node rebooted mid-rollout.
 
-- **Wrong window maths.** Averaging the five per-sample percentages instead of dividing summed failures by summed requests. Under bursty traffic, a quiet 2-second slot with 1 failure in 2 requests counts as 50 %. *Mutant: aborted a healthy rollout.*
-- **Wrong attribution.** Counting ingress-wide 5xx means app-blue's errors (30 % in the test) abort green's rollout. *Mutant: aborted at stage 1.*
-- **Retries hide the crash.** HAProxy `retries` plus `option redispatch`, or nginx's default `proxy_next_upstream error timeout`, resend failed green requests to blue. Clients get 200s and the access log names blue as the server, so the crash never appears in telemetry. *Mutant: never aborted.*
-- **Default timeouts.** A hung green (accepts, never answers) produces nothing until the proxy's upstream timeout fires, which defaults to 30–60 s. That is far past the 20 s limit. *Mutant (60 s): never aborted within the limit.*
-- **Writing your own proxy doesn't avoid these traps; it moves them.** An agent may skip HAProxy and nginx and write its own proxy, as an external frontier run did with Go. It then has to make every one of these decisions itself. Go's `httputil.ReverseProxy` with the default transport has **no** response timeout, so a hung green blocks indefinitely. Its connection pooling can keep a dead backend looking alive on reused connections. Any retry or fallback logic hides green's failures. The golden solution is exactly this kind of proxy, and the `redispatch` and `default_timeout` mutants are patches to *its* code, both caught.
-- **0/0 treated as healthy.** With no traffic, a naive `errors / max(n, 1)` or `n == 0 → healthy` promotes all the way to 0/100 on no evidence. *Mutant: promoted with zero traffic.*
-- **Reload instead of runtime API.** Changing weights by rewriting the config and reloading (or restarting) the proxy drops requests mid-shift and resets cumulative counters. That gives negative deltas, lost samples or client errors, and the healthy scenario requires zero failed client requests.
-- **A dead proxy goes unnoticed.** An engine that only reads telemetry sees an empty window when the proxy dies, so it waits for traffic that will never be counted while every client request fails. *Mutant (no liveness check): never aborted, 900 failed client requests.*
-- **Privilege and namespace end state.** The instruction lists exactly which `/proc` values must hold, and any mechanism that produces them passes, so this is not a hunt for one syscall sequence. The common tools just don't produce the end state by default. `ip netns exec` leaves the process as root. `sudo -u canary` and `su` keep the caller's session and, often, a TTY. `runuser` keeps inheritable or ambient bits unless they are cleared. `setcap` on the proxy is checked and fails. A process started with `&` from `canaryctl` shares the caller's session. And because the check covers *every* non-target process in the namespace, a root helper or watchdog left behind fails too.
-- **Sticky abort.** After rollback, the verifier heals green. Engines that keep evaluating re-promote. Engines that leave green's weight above 0 (draining instead of zeroing) send it traffic, and the verifier sees that on app-green's own counter.
+### Core step 1: making nginx tell the truth about a failing canary
 
-All-or-nothing grading means any one of these zeros the reward. Most of them let the agent believe it has finished.
+nginx is built to *shield clients from a bad upstream*. A canary analysis needs the opposite: every green failure must reach green's client and green's log line. Three defaults each defeat a requirement, and nothing in a typical config mentions them:
 
-**Empirical status:** The golden solution (Go proxy plus Python controller) passes all 110 tests of the pytest suite on a live build. The six mutants above, and three more (abort to 99/1, engine left as root, incomplete idle status), were run against the suite, and each failed its targeted tests.
+- **Passive health checks.** The default is `max_fails=1` with `fail_timeout=10s`. After one connection error or timeout, each nginx worker stops sending to app-green for 10 s. When green crashes at 50/50, green gets a couple of requests per 10 s instead of about 300. Those few failures are under 1 % of the window, so the engine sees a *healthy* window, and when the dwell runs out it **advances the dead canary to 0/100**. In the mutation run, this abort came only after blue was marked `down` and nginx had nowhere else to send traffic, 8.9 s after the crash. *Mutant `nginx_max_fails`: missed deadline, and advanced while green was down.*
+- **Retries to the other upstream.** The default `proxy_next_upstream error timeout` resends a refused green request to blue. The client sees 200, and the log line becomes `127.0.0.1:9002, 127.0.0.1:9001  502, 200`. Parsers that expect one address drop the line or count it for blue. *Mutant `nginx_next_upstream`.*
+- **The 60 s upstream timeout.** A hung green produces nothing for a minute, far beyond the 20 s limit. *Mutant `nginx_read_timeout`.*
 
-**External frontier run:** one run reached 105 of 110 tests (the 5 isolation tests couldn't run in its non-root sandbox). It is **not** a valid difficulty data point, because its input included the verifier and the previous golden solution. A blind run, given only `instruction.md` and the environment, is still needed. If a blind run also passes, the task needs to be made harder.
+Beyond those, nginx itself adds work:
+- `weight=0` is invalid, so the end stages need `down`.
+- A split change is a graceful reload, which must not fail requests.
+- Running nginx unprivileged means relocating its pid, temp and log paths away from root-owned defaults.
+- The access-log format must be designed for attribution (`$upstream_addr`, `$upstream_status`).
 
-**Depth versus volume.** One review asked whether the difficulty is volume rather than a single insight. The checks do touch several areas, but one insight runs through most of them: *a canary engine is only as good as its view of the canary's failures, and the proxy's defaults are built to hide them.* Retries move failures to blue. Long timeouts delay them. 5xx-only counting misses failures the proxy itself generates. A dead proxy produces no telemetry at all. An agent that understands this passes the crash, hang, attribution and proxy-death scenarios together. One that doesn't fails most of them.
+Fairness: the instruction never names these directives. It states the properties they break. *"Only the engine changes the split ... including while app-green is failing"* and *"each client request goes to exactly one target"* are outcomes an expert can test in minutes, for example by killing green in their own setup.
+
+### Core step 2: crash-consistent decisions
+
+The verifier SIGKILLs the engine at arbitrary points, including right after a stage change and at the moment green starts failing. It also simulates a reboot: every process running as `canary` dies, and `/run` and `/tmp` revert to their container-start contents. Common designs fail in different ways:
+
+- **State in memory or in `/run`/`/tmp`.** After a reboot, `up` finds nothing and starts at idle or 100 % blue. *Mutant `state_in_run`.*
+- **No resume.** `up` restarts nginx but not the engine, so the rollout stalls forever. *Mutant `no_resume`.*
+- **"Safe default" restart at 100 % blue.** This flips live traffic back mid-rollout. The verifier checks the split is back at the current stage within 5 s of `up`. *Mutant `up_always_blue`.*
+- **Act first, persist later.** An abort applied to nginx but not persisted resumes the rollout after a reboot and sends traffic back to the bad canary. *Mutant `abort_not_durable`.*
+- **Log-then-act or act-then-log without reconciliation.** A decision is lost from the log, or logged twice, or logged after the restart instead of right after its triggering sample. The verifier requires each decision exactly once, directly after the sample that caused it.
+- **Judging a resumed rollout on stale or partial evidence.** A resumed engine must start a fresh five-sample window. Advancing because "the dwell has passed" on a restart is a decision on no evidence. The verifier recomputes every decision with a fresh window at each `resumed` event. *Mutant `no_resumed_event`* is caught too.
+
+### Kept from earlier revisions (still mutation-checked)
+
+- **Rolling-window maths:** a ratio of sums, not the mean of per-sample rates. *Mutant `mean_of_ratios`.*
+- **Attribution:** blue's errors are not green's. *Mutant `all_5xx`.*
+- **No decision without evidence.** *Mutant `empty_is_healthy`.*
+- **Abort to 100/0, not drain.** *Mutant `drain_not_zero`.*
+- **Ingress-death watchdog.** *Mutant `no_watchdog`.*
+- **The isolation end state:** every process unprivileged, in the namespace, detached. *Mutant `root_engine`.*
+- **The schema contract.** *Mutant `idle_schema`.*
+
+All-or-nothing grading means any one of these zeros the reward, and most of them pass a demo.
+
+**Empirical status:** The golden solution passes the full suite. All fifteen mutants fail their targeted tests. The difficulty gate itself (3 GPT-6.1 Sol and 3 Kimi 3.1 Pro trials) must be re-run by the reviewer, because those models aren't available here.
 
 ## 3. Why is this hard for a professional expert?
 
-A senior SRE knows what a canary is. The time goes on the details:
+- **nginx upstream semantics.** You need to know that passive health checks are on by default and per worker, and that they count connect errors and timeouts (not 5xx responses once `proxy_next_upstream` is off). You need to know how `proxy_next_upstream` rewrites the log variables, and that zero weights need `down`. Most engineers have shipped an nginx reverse proxy without ever touching `max_fails`.
+- **Running nginx as an unprivileged daemon in a namespace.** That means a relocated prefix, pid and temp paths, an error log usable from the very first line (`-e`), reload signalling as the same user, and orphaned workers after a SIGKILLed master.
+- **Crash-consistent control loops.** Write-ahead persistence with atomic replace and fsync, recovery that re-applies desired state, and reconciliation of the decision log. This is the core of every Kubernetes-style controller, and it is easy to get subtly wrong.
+- **Telemetry correctness.** Tail an access log across reloads and restarts, attribute each line to green, and keep counts within 5 % of ground truth.
 
-- **Proxy internals.** You have to know that HAProxy's per-server weights can be changed live over the admin socket, that `retries`/`redispatch` move failures onto another server, which termination flags mean the server failed rather than the client, and that `log` can target a unix datagram socket when no syslog daemon exists. The nginx route is harder: it has no live weights without the commercial API, so you need upstream reloads without dropping requests, and per-upstream status in the access log.
-- **Telemetry correctness.** Turning a streamed log or cumulative counters into exact 2-second deltas and a 10-second ratio, without double counting across reloads and without letting the sampler drift, and confirming the counts agree with ground truth to within 5 %.
-- **Linux process isolation.** Entering the namespace while still privileged and only then dropping identity, clearing supplementary groups, the four capability sets, and session leadership versus process groups. The target state is spelled out, but most engineers have used `ip netns exec` without ever producing a capability-free, detached daemon from a root caller, and they find the gaps by checking `/proc`.
-- **Timing.** Designing an engine whose worst-case detection fits 8/18/20-second limits means reasoning about sample alignment, window fill and proxy timeouts together.
-
-Estimate: about 2.5 h for an expert who knows HAProxy's runtime API, and about 10 h for a junior who has to discover the retry, timeout and privilege traps by failing.
+Estimate: about 4 h for an expert, about 15 h for a junior engineer.
 
 ## 4. Real-world application
 
-This is the core loop of every progressive-delivery system: Argo Rollouts, Flagger, Spinnaker/Kayenta, AWS CodeDeploy canaries, and internal deploy tools at most large companies. Teams build exactly this when they run on bare VMs, edge nodes or appliances without Kubernetes or a service mesh. The failure modes tested are the ones that cause real outages:
-
-- A canary that **hangs** rather than crashes and goes unnoticed because the proxy's timeout is longer than the analysis window.
-- **Retries hiding a broken canary.** It looks healthy, gets promoted, and fails at 100 %.
-- **False rollbacks** caused by low-traffic noise or by another service's errors, which teach teams to switch automation off.
-- Deploy agents running **as root** on shared hosts when they only need to touch a proxy socket.
+This is the core of progressive delivery (Argo Rollouts, Flagger, Spinnaker/Kayenta, internal deploy tools) on infrastructure where the ingress is fixed by the platform team. nginx is the most common such ingress. The failure modes are real outage patterns:
+- a canary hidden by the ingress's own health checks or retries, then promoted and failing at 100 %;
+- a deploy controller restarted mid-rollout (pod rescheduled, node rebooted) that loses its place, re-runs a stage, or forgets that it aborted;
+- deploy agents running as root when they only need to drive a proxy.
 
 ## 5. Data origin
 
-- **Proxy:** the real HAProxy 2.8 (Ubuntu 24.04 package); nginx is also installed as an alternative. No mocks.
-- **Targets:** a small threaded HTTP service (`/opt/apps/app.py`, about 75 lines) run twice as `app-blue` 1.0 and `app-green` 2.0, as the unprivileged `apps` user inside the namespace. It supports deterministic fault modes: ratio (every Nth request returns 500), crash (closes its listener) and hang (accepts and never responds). Control is through a root-only unix socket that also exposes ground-truth counters.
-- **Traffic:** generated live by the verifier: steady 60 rps, a bursty 10/200 rps pattern, and silence.
-- **Thresholds and limits:** taken from the brief (2 s, 10 s, 5 %, 90/10 → 50/50 → 0/100). The minimum sample (20) and failure definition follow production canary analysers. The latency limits are derived from a simulation of the sampling maths.
-
-Realism is high. The only concession is that the two "containers" are processes in a shared namespace (see the PROPOSAL open points).
+- **Ingress:** the real nginx 1.24 (`nginx-light`, Ubuntu 24.04). No mocks.
+- **Targets:** a small threaded HTTP service run twice as `app-blue` 1.0 and `app-green` 2.0, as user `apps` inside the namespace. It has deterministic fault modes: ratio (every Nth request returns 500), crash (closes its listener and drops open connections) and hang (accepts and never responds). Control is through a root-only socket that also exposes ground-truth counters.
+- **Traffic:** generated live by the verifier: a steady 60 rps, a bursty 10/200 rps pattern, and silence.
+- **Crashes and reboots:** real SIGKILLs and a simulated reboot (all `canary` processes killed; `/run` and `/tmp` reset to the container-start baseline).

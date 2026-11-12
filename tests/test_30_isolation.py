@@ -3,7 +3,7 @@ Checked on every non-target process in the netns during a healthy rollout and af
 import pytest
 import harness as H
 
-WHEN = {"mid-rollout": "healthy", "after-proxy-restart": "proxykill"}
+WHEN = {"mid-rollout": "healthy", "after-proxy-restart": "proxykill", "after-reboot": "chaos"}
 
 
 @pytest.mark.parametrize("when", WHEN)
@@ -26,3 +26,12 @@ def test_every_toolchain_process_is_unprivileged_and_detached(scenario, when):
 
 def test_no_file_capabilities_or_setuid_helpers():
     assert not H.file_privilege_problems(), H.file_privilege_problems()
+
+
+@pytest.mark.parametrize("when", ["before-reboot", "after-reboot"])
+def test_ingress_is_nginx_end_to_end(scenario, when):
+    """The :8080 listeners and every process holding a connection to a target are /usr/sbin/nginx."""
+    r = scenario("ingress")
+    if when == "after-reboot": assert r["up"]["rc"] == 0, r["up"]["stderr"]
+    probs = r["before" if when == "before-reboot" else "after"]
+    assert not probs, probs

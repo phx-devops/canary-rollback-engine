@@ -20,11 +20,23 @@ THRESHOLD, MIN_REQ, WINDOW = 0.05, 20, 5
 STATES = {"idle", "shifting", "promoted", "aborted"}
 STAGE_W = {1: {"app-blue": 90, "app-green": 10}, 2: {"app-blue": 50, "app-green": 50}, 3: {"app-blue": 0, "app-green": 100}}
 BLUE, GREEN = {"app-blue": 100, "app-green": 0}, {"app-blue": 0, "app-green": 100}
-DECISION_TYPES = ("sample", "stage", "aborted", "promoted")
+DECISION_TYPES = ("sample", "stage", "aborted", "promoted", "resumed")
+BASELINE = "/etc/canary-env/baseline.txt"    # /run and /tmp entries present at container start
 
 
 def isint(x): return isinstance(x, int) and not isinstance(x, bool)
 def isnum(x): return isinstance(x, (int, float)) and not isinstance(x, bool)
+
+
+def process_alive(pid, name=None):
+    if not isint(pid) or pid <= 0: return False
+    try:
+        with open(f"/proc/{pid}/stat") as f: stat = f.read()
+        comm = stat[stat.index("(") + 1:stat.rindex(")")]
+        state = stat[stat.rindex(")") + 2:].split()[0]
+        return state not in ("Z", "X") and (name is None or comm == name)
+    except (OSError, ValueError, IndexError):
+        return False
 
 
 # ---------------------------------------------------------------- pure checks (unit-tested in selftest)
@@ -38,10 +50,13 @@ def status_problem(s):
     st = s["state"]
     if st not in STATES: return f"bad state {st!r}"
     if st == "idle":
-        return None if s["weights"] == BLUE and s["abort_reason"] is None else "idle must be 100/0 with abort_reason null"
+        idle = (s["rollout_id"] is None and s["stage"] is None and s["weights"] == BLUE
+                and s["pid"] is None and s["window"] is None and s["abort_reason"] is None)
+        return None if idle else "idle must have null rollout_id, stage, pid, window and abort_reason, with 100/0 weights"
     if not isinstance(s["rollout_id"], str) or not s["rollout_id"]: return "rollout_id must be a non-empty string"
     if s["stage"] not in (1, 2, 3) or isinstance(s["stage"], bool): return "stage must be 1, 2 or 3"
-    if not isint(s["pid"]): return "pid must be an integer"
+    if st == "shifting" and not isint(s["pid"]): return "pid must be an integer while shifting"
+    if st != "shifting" and not (s["pid"] is None or isint(s["pid"])): return "pid must be an integer or null"
     w = s["window"]
     if not (isinstance(w, dict) and w.get("seconds") == 10 and isint(w.get("green_requests")) and isint(w.get("green_errors"))
             and (w.get("error_rate") is None or isnum(w.get("error_rate")))):
@@ -72,6 +87,8 @@ def parse_events(lines):
         elif t == "aborted" and not (isinstance(e.get("reason"), str) and e["reason"] and isint(e.get("green_requests"))
                                      and isint(e.get("green_errors")) and "error_rate" in e):
             bad.append(f"line {i}: aborted event needs reason, green_requests, green_errors, error_rate")
+        elif t == "resumed" and e.get("stage") not in (1, 2, 3):
+            bad.append(f"line {i}: resumed event needs stage 1-3")
         evs.append(e)
     for a, b in zip(evs, evs[1:]):
         if b["ts"] < a["ts"] - 0.5: bad.append("timestamps go backwards"); break
@@ -81,9 +98,18 @@ def parse_events(lines):
 def rollout_events(evs, rid): return [e for e in evs if e.get("rollout_id") == rid]
 
 
+def segments(mine):
+    """Sample runs of one engine lifetime: a `resumed` event starts a new segment."""
+    segs = [[]]
+    for e in mine:
+        if e["type"] == "resumed": segs.append([])
+        elif e["type"] == "sample": segs[-1].append(e)
+    return segs
+
+
 def cadence_problem(mine):
     samples = [e for e in mine if e["type"] == "sample"]
-    gaps = [b["ts"] - a["ts"] for a, b in zip(samples, samples[1:])]
+    gaps = [b["ts"] - a["ts"] for seg in segments(mine) for a, b in zip(seg, seg[1:])]
     if len(gaps) < 3: return f"only {len(samples)} samples"
     med = statistics.median(gaps)
     if not (1.7 <= med <= 2.3) or max(gaps) > 3.0: return f"median gap {med:.2f}s, max {max(gaps):.2f}s"
@@ -91,6 +117,10 @@ def cadence_problem(mine):
 
 
 def terminal_problem(mine, expect):
+    cur = None
+    for e in mine:
+        if e["type"] == "stage": cur = e["stage"]
+        if e["type"] == "resumed" and e["stage"] != cur: return f"resumed at stage {e['stage']} but the log is at stage {cur}"
     stages = [e["stage"] for e in mine if e["type"] == "stage"]
     term = [e["type"] for e in mine if e["type"] in ("aborted", "promoted")]
     if stages[:1] != [1] or stages != sorted(stages) or len(set(stages)) != len(stages): return f"stage events {stages}"
@@ -100,27 +130,41 @@ def terminal_problem(mine, expect):
 
 
 def rule_problems(mine, error_abort=True):
-    """Apply the rollback rule to the engine's own samples and list every decision it got wrong."""
-    probs, seen = [], []
-    for e in mine:
-        if e["type"] == "sample": seen.append(e); continue
-        last = seen[-WINDOW:]
-        n = sum(x["green_requests"] for x in last); f = sum(x["green_errors"] for x in last)
-        evaluated = len(last) == WINDOW and n >= MIN_REQ
-        if (e["type"] == "stage" and e["stage"] > 1) or e["type"] == "promoted":
-            if not (evaluated and f / n <= THRESHOLD):
-                probs.append(f"{e['type']} {e.get('stage', '')} decided on window {f}/{n} ({len(last)} samples)")
-        if e["type"] == "aborted" and error_abort:
-            if not (evaluated and f / n > THRESHOLD):
-                probs.append(f"abort decided on window {f}/{n}")
-            elif (e["green_requests"], e["green_errors"]) != (n, f):
-                probs.append(f"abort logged {e['green_errors']}/{e['green_requests']} but window was {f}/{n}")
-    aborted = any(e["type"] == "aborted" for e in mine)
-    for i in range(WINDOW - 1, len(seen)):
-        w = seen[i - WINDOW + 1:i + 1]
+    """Apply the rollback rule to the engine's own samples and list every decision it got wrong.
+    A `resumed` event starts a fresh window. A decision must come right after the sample that
+    triggered it (an abort because the ingress died is exempt when error_abort is False)."""
+    probs, seen, prev = [], [], None
+    for i, e in enumerate(mine):
+        t = e["type"]
+        if t == "resumed": seen = []
+        elif t == "sample": seen.append(e)
+        else:
+            decision = (t == "stage" and e["stage"] > 1) or t == "promoted" or (t == "aborted" and error_abort)
+            if decision and (prev is None or prev["type"] != "sample"):
+                probs.append(f"{t} {e.get('stage', '')} does not directly follow the sample that triggered it")
+            last = seen[-WINDOW:]
+            n = sum(x["green_requests"] for x in last); f = sum(x["green_errors"] for x in last)
+            evaluated = len(last) == WINDOW and n >= MIN_REQ
+            if (t == "stage" and e["stage"] > 1) or t == "promoted":
+                if not (evaluated and f / n <= THRESHOLD):
+                    probs.append(f"{t} {e.get('stage', '')} decided on window {f}/{n} ({len(last)} samples)")
+            if t == "aborted" and error_abort:
+                if not (evaluated and f / n > THRESHOLD):
+                    probs.append(f"abort decided on window {f}/{n}")
+                elif (e["green_requests"], e["green_errors"]) != (n, f):
+                    probs.append(f"abort logged {e['green_errors']}/{e['green_requests']} but window was {f}/{n}")
+        prev = e
+    # every evaluated breach must be followed at once by the abort
+    win = []
+    for i, e in enumerate(mine):
+        if e["type"] == "resumed": win = []; continue
+        if e["type"] != "sample": continue
+        win.append(e); w = win[-WINDOW:]
         n = sum(x["green_requests"] for x in w); f = sum(x["green_errors"] for x in w)
-        if n >= MIN_REQ and f / n > THRESHOLD and not (aborted and i == len(seen) - 1):
-            probs.append(f"breach {f}/{n} at sample {i} was not acted on")
+        if len(w) == WINDOW and n >= MIN_REQ and f / n > THRESHOLD:
+            nxt = mine[i + 1] if i + 1 < len(mine) else None
+            if not (nxt and nxt["type"] == "aborted"):
+                probs.append(f"breach {f}/{n} at event {i} was not acted on")
     return probs
 
 
@@ -193,10 +237,12 @@ class Load:
 
 class Watch:
     """Poll the status file every 0.2 s: validate it and record when each stage/terminal state first appears."""
-    def __init__(self): self.first, self.run, self.bad = {}, True, []
+    def __init__(self, allow_missing=False): self.first, self.run, self.bad, self.allow_missing = {}, True, [], allow_missing
     def loop(self):
         while self.run:
-            s = status(); p = status_problem(s)
+            s = status()
+            if not s and self.allow_missing and not os.path.exists(STATUS): time.sleep(0.2); continue
+            p = status_problem(s)
             if p and len(self.bad) < 5: self.bad.append(f"{p}: {s}")
             key = s.get("state") if s.get("state") in ("promoted", "aborted") else ("stage", s.get("stage"))
             self.first.setdefault(key, time.time()); time.sleep(0.2)
@@ -267,3 +313,73 @@ def file_privilege_problems():
                         shell=True, capture_output=True, text=True).stdout.strip()
     su = subprocess.run("find /opt/canary -perm /6000 -type f 2>/dev/null", shell=True, capture_output=True, text=True).stdout.strip()
     return [x for x in (fc, su) if x]
+
+
+# ---------------------------------------------------------------- nginx-only ingress, reboots
+
+NGINX_EXE = "/usr/sbin/nginx"
+
+
+def _exe(pid):
+    try: return os.readlink(f"/proc/{pid}/exe")
+    except OSError: return None
+
+
+def _socket_owners(match):
+    """pid -> comm for processes owning /proc/net/tcp rows (in our netns) that satisfy match(row)."""
+    with open("/proc/net/tcp") as f: rows = [r.split() for r in f.read().splitlines()[1:]]
+    socks = {f"socket:[{r[9]}]" for r in rows if match(r)}
+    out = {}
+    if not socks: return out
+    for p in filter(str.isdigit, os.listdir("/proc")):
+        try:
+            if any(os.readlink(f"/proc/{p}/fd/{fd}") in socks for fd in os.listdir(f"/proc/{p}/fd")):
+                out[int(p)] = _exe(int(p))
+        except OSError: pass
+    return out
+
+
+def ingress_problems(seconds=3.0):
+    """Every :8080 listener, and every process holding a connection to a target, must be nginx.
+    Upstream connections are short-lived, so sample repeatedly while traffic flows."""
+    probs, seen_upstream = set(), 0
+    for pid, exe in _socket_owners(lambda r: r[1] == "0100007F:1F90" and r[3] == "0A").items():
+        if exe != NGINX_EXE: probs.add(f":8080 listener pid {pid} is {exe}")
+    end = time.time() + seconds
+    while time.time() < end:
+        owners = _socket_owners(lambda r: r[2] in ("0100007F:2329", "0100007F:232A") and r[3] == "01")
+        seen_upstream += len(owners)
+        for pid, exe in owners.items():
+            if pid != os.getpid() and exe != NGINX_EXE: probs.add(f"pid {pid} ({exe}) holds a connection to a target")
+        time.sleep(0.05)
+    if not seen_upstream: probs.add("no upstream connections observed")
+    return sorted(probs)
+
+
+def reboot():
+    """Simulate a node reboot: kill every process running as canary, lose /run and /tmp beyond what
+    was there when the container started. /var/lib, /var/log and /opt survive."""
+    import shutil
+    uid = pwd.getpwnam("canary").pw_uid
+    for _ in range(3):
+        subprocess.run(["pkill", "-9", "-u", str(uid)], capture_output=True)
+        time.sleep(0.3)
+    try:
+        with open(BASELINE) as f: keep = set(f.read().split())
+    except OSError: keep = {"/run/netns", "/run/apps"}
+    for top in ("/run", "/tmp"):
+        for name in os.listdir(top):
+            path = f"{top}/{name}"
+            if path in keep: continue
+            try:
+                if os.path.isdir(path) and not os.path.islink(path): shutil.rmtree(path)
+                else: os.unlink(path)
+            except OSError: pass
+
+
+def kill_engine():
+    st = status(); pid = st.get("pid")
+    if isint(pid):
+        try: os.kill(pid, 9)
+        except OSError: pass
+    return pid

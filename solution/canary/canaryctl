@@ -1,90 +1,108 @@
 #!/usr/bin/env python3
 """canaryctl up | start [--dwell S] | status | reset
 
-Run as root from the default network namespace (or as canary inside the canary netns). Every
-long-running process it starts (the proxy and the engine) enters the netns while still privileged,
-then drops to canary with no groups and no capabilities, then detaches into its own session."""
+Run as root from the default network namespace (the node agent's view). Every long-running process
+it starts (nginx and the engine) enters the canary netns while still privileged, then drops to
+canary with no groups and no capabilities; nginx daemonises itself, the engine gets `setsid -f`."""
 import argparse, json, os, pwd, signal, subprocess, sys, time, uuid
 HERE = os.path.dirname(os.path.realpath(__file__)); sys.path.insert(0, HERE)
-from common import RUN, LOGDIR, PROXY_SOCK, STATUS, EVENTS, proxy_argv, proxy_pid, set_weights, write_status, event
+from common import (RUN, LOGDIR, LIB, STATUS, EVENTS, ACCESS_LOG, ERROR_LOG, ENGINE_PID, IDLE, load_state,
+                    save_state, desired_weights, write_conf, nginx_pid, kill_stray_nginx, start_nginx, apply,
+                    read_pid, alive, write_status, status_from_state, event, reconcile_events)
 
 U = pwd.getpwnam("canary"); NETNS = "/run/netns/canary"
 ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "HOME": U.pw_dir, "USER": "canary", "LANG": "C.UTF-8"}
 
-def in_target():
-    return os.getuid() == U.pw_uid and os.stat("/proc/self/ns/net").st_ino == os.stat(NETNS).st_ino
-
-def launch(argv, log):
+def drop():
+    """Prefix that enters the netns as root, then becomes canary with nothing left over."""
     if os.getuid() == 0:
-        pre = ["nsenter", f"--net={NETNS}", "--", "setpriv", f"--reuid={U.pw_uid}", f"--regid={U.pw_gid}", "--clear-groups",
-               "--inh-caps=-all", "--bounding-set=-all", "--no-new-privs", "--", "setsid", "-f"]
-    elif in_target(): pre = ["setsid", "-f"]
-    else: sys.exit("canaryctl: run as root, or as canary inside the canary network namespace")
-    with open(log, "ab") as lf:
-        if os.getuid() == 0: os.fchown(lf.fileno(), U.pw_uid, U.pw_gid)   # the canary-owned processes reopen it
-        subprocess.run(pre + argv, stdin=subprocess.DEVNULL, stdout=lf, stderr=lf, env=ENV, check=True, cwd="/")
+        return ["nsenter", f"--net={NETNS}", "--", "setpriv", f"--reuid={U.pw_uid}", f"--regid={U.pw_gid}",
+                "--clear-groups", "--inh-caps=-all", "--bounding-set=-all", "--no-new-privs", "--"]
+    if os.getuid() == U.pw_uid and os.stat("/proc/self/ns/net").st_ino == os.stat(NETNS).st_ino: return []
+    sys.exit("canaryctl: run as root, or as canary inside the canary network namespace")
+
+def own(path):
+    if os.getuid() == 0: os.chown(path, U.pw_uid, U.pw_gid)
+
+def prepare():
+    """Directories and files the canary-owned processes write, created as canary's (a reboot wipes /run)."""
+    for d in (RUN, LOGDIR, LIB, f"{LIB}/nginx"): os.makedirs(d, exist_ok=True); own(d)
+    for d in ("client_body", "proxy", "fastcgi", "uwsgi", "scgi"): os.makedirs(f"{LIB}/nginx/{d}", exist_ok=True); own(f"{LIB}/nginx/{d}")
+    for f in (EVENTS, ACCESS_LOG, ERROR_LOG):
+        with open(f, "a"): pass
+        own(f)
 
 def engine_pid():
+    pid = read_pid(ENGINE_PID)
     try:
-        pid = int(open(f"{RUN}/engine.pid").read())
-        with open(f"/proc/{pid}/cmdline") as f: return pid if "engine.py" in f.read() else None
-    except (OSError, ValueError): return None
+        with open(f"/proc/{pid}/cmdline") as f: ok = "engine.py" in f.read()
+        return pid if ok and alive(pid, "python3") else None
+    except (OSError, TypeError): return None
 
-def mkdirs():
-    for d in (RUN, LOGDIR):
-        os.makedirs(d, exist_ok=True)
-        if os.getuid() == 0: os.chown(d, U.pw_uid, U.pw_gid)
-    # Create the event log as canary's before anyone appends to it: if root's `reset` created it first,
-    # the engine (running as canary) could not write to it.
-    with open(EVENTS, "a"): pass
-    if os.getuid() == 0: os.chown(EVENTS, U.pw_uid, U.pw_gid)
+def ensure_nginx(st):
+    """nginx serving the split the durable state calls for. Left alone while an engine owns it."""
+    if nginx_pid() and engine_pid(): return          # a running engine owns nginx's config
+    b, g = desired_weights(st)
+    changed = write_conf(b, g); own(f"{LIB}/nginx.conf")
+    if not nginx_pid():
+        kill_stray_nginx(U.pw_uid)
+        if not start_nginx(drop()): sys.exit(f"canaryctl: nginx did not start (see {ERROR_LOG})")
+    elif changed:
+        apply(st)
 
-def idle():
-    write_status({"rollout_id": None, "state": "idle", "stage": None, "weights": {"app-blue": 100, "app-green": 0},
-                  "pid": None, "window": None, "abort_reason": None})
-    if os.getuid() == 0: os.chown(STATUS, U.pw_uid, U.pw_gid)
-
-def up():
-    mkdirs()
-    if not proxy_pid():
-        launch(proxy_argv(), f"{LOGDIR}/proxy.out")
-        for _ in range(50):
-            if proxy_pid() and os.path.exists(PROXY_SOCK): break
-            time.sleep(0.1)
-        else: sys.exit("canaryctl: proxy did not come up (see /var/log/canary/proxy.out)")
-    if not engine_pid():
-        set_weights(100, 0)
-        if not os.path.exists(STATUS): idle()
+def launch_engine(resume):
+    args = ["python3", "-I", f"{HERE}/engine.py"] + (["--resume"] if resume else [])
+    with open(f"{LOGDIR}/engine.out", "ab") as lf:
+        own(f"{LOGDIR}/engine.out")
+        subprocess.run(drop() + ["setsid", "-f"] + args, stdin=subprocess.DEVNULL, stdout=lf, stderr=lf,
+                       env=ENV, check=True, cwd="/")
+    for _ in range(50):
+        pid = engine_pid()
+        if pid and read_status().get("pid") == pid: return pid
+        time.sleep(0.1)
+    sys.exit("canaryctl: engine did not report within 5 s")
 
 def stop_engine():
     pid = engine_pid()
     if pid:
         os.kill(pid, signal.SIGTERM)
         for _ in range(50):
-            if not os.path.exists(f"/proc/{pid}"): break
+            if not alive(pid, "python3"): break
             time.sleep(0.1)
 
-def status():
+def read_status():
     try:
         with open(STATUS) as f: return json.load(f)
-    except OSError: return {"state": "idle"}
+    except (OSError, ValueError): return {}
+
+def up():
+    prepare(); st = load_state()
+    ensure_nginx(st)
+    if st["state"] == "shifting":
+        if not engine_pid(): launch_engine(resume=True)
+    else:
+        reconcile_events(st)                       # a decision the crash cut off still gets logged once
+        if read_status().get("rollout_id") != st["rollout_id"] or not os.path.exists(STATUS):
+            write_status(status_from_state(st, pid=None)); own(STATUS)
+
+def new_state(**kw): return {**IDLE, **kw}
 
 ap = argparse.ArgumentParser(prog="canaryctl"); sub = ap.add_subparsers(dest="cmd", required=True)
 sub.add_parser("up"); sub.add_parser("status"); sub.add_parser("reset")
 s = sub.add_parser("start"); s.add_argument("--dwell", type=float, default=30)
 a = ap.parse_args()
 
-if a.cmd == "up": up(); print(json.dumps(status()))
-elif a.cmd == "status": print(json.dumps(status()))
+if a.cmd == "up":
+    up()
+elif a.cmd == "status":
+    pass
 elif a.cmd == "reset":
-    up(); stop_engine(); set_weights(100, 0); idle(); event({"type": "reset"}); print(json.dumps(status()))
+    prepare(); stop_engine(); st = new_state(); save_state(st); own(f"{LIB}/state.json")
+    ensure_nginx(st); write_status(status_from_state(st)); own(STATUS); event({"type": "reset"})
 elif a.cmd == "start":
     if a.dwell < 10: sys.exit("canaryctl: --dwell must be >= 10 seconds (one full evaluation window)")
-    up(); stop_engine(); set_weights(100, 0)
-    rid = uuid.uuid4().hex[:12]
-    launch(["python3", "-I", f"{HERE}/engine.py", "--dwell", str(a.dwell), "--id", rid], f"{LOGDIR}/engine.out")
-    for _ in range(50):
-        st = status()
-        if st.get("rollout_id") == rid: print(json.dumps(st)); sys.exit(0)
-        time.sleep(0.1)
-    sys.exit("canaryctl: engine did not report within 5 s")
+    prepare(); stop_engine()
+    st = new_state(rollout_id=uuid.uuid4().hex[:12], state="shifting", stage=1, dwell=a.dwell, stage_entered_at=time.time())
+    save_state(st); own(f"{LIB}/state.json")      # the engine logs the stage 1 event (or recovery does)
+    ensure_nginx(st); launch_engine(resume=False)
+print(json.dumps(read_status() or status_from_state(load_state())))
