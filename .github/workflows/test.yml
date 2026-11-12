@@ -1,0 +1,26 @@
+name: Docker tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Verify Docker is available
+        run: |
+          docker info
+          docker compose version
+
+      - name: Run test target
+        run: make test DOCKER=docker COMPOSE="docker compose"

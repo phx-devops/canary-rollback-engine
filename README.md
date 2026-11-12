@@ -14,61 +14,60 @@ requirements and command-line contract are in [instruction.md](instruction.md).
 
 - `environment/` — Ubuntu-based Docker environment, network-namespace setup,
   and the sample applications.
-- `solution/` — reference implementation: a Go ingress proxy and Python
-  rollout controller. `solution/alternatives/haproxy/` contains an alternate
-  implementation.
+- `solution/` — reference implementation: the nginx ingress and Python
+  rollout controller.
 - `tests/` — pytest verifier, self-tests for the verifier, and mutation tests.
 - `RUNNING.md` — detailed environment, grading, and validation notes.
 
 ## Requirements
 
-- Docker with the Docker Compose plugin
+- Docker with the Docker Compose plugin, or rootful Podman with a Compose provider
 - A shell on the host
 
 The container image provides the task's runtime dependencies, including
-Python, pytest, Go, and the networking utilities. Runtime network access is
-not required.
+Python, pytest, Go, and the networking utilities. The solution does not need
+runtime network access. Rootless Podman is not supported because the
+environment creates and enters a nested network namespace.
 
 ## Build and start the environment
 
-Run these commands from the repository root:
+Run these commands from the repository root. `make up` builds the image and
+starts the environment; `make shell` opens a root shell in the task container:
 
 ```sh
-docker compose -f environment/docker-compose.yaml build
-docker compose -f environment/docker-compose.yaml up -d
-docker compose -f environment/docker-compose.yaml exec client bash
+make up
+make shell
 ```
 
-The final command opens a root shell in the task container. The task environment
-and test workflow are described in [RUNNING.md](RUNNING.md).
+The task environment and test workflow are described in [RUNNING.md](RUNNING.md).
 
 ## Install and run the reference solution
 
-From the repository root, copy the reference solution into the container and
-run its setup script:
+`make install` starts the environment if needed, copies the reference solution
+into the container, and runs its setup script:
 
 ```sh
-docker compose -f environment/docker-compose.yaml cp solution client:/solution
-docker compose -f environment/docker-compose.yaml exec client bash /solution/solve.sh
+make install
 ```
 
-This builds and installs the proxy and controller under `/opt/canary/bin`, then
-starts the ingress at 100% blue.
+This installs the controller under `/opt/canary/bin`, then starts the ingress
+at 100% blue.
 
 ## Run the verifier
 
-Copy the tests into the running container and run the full suite:
+Run the full verifier suite with:
 
 ```sh
-docker compose -f environment/docker-compose.yaml cp tests client:/tests
-docker compose -f environment/docker-compose.yaml exec client bash /tests/test.sh
+make test
 ```
 
 The verifier writes its reward and logs under `/logs/verifier/`. Additional
 pytest arguments can be passed to select tests or scenarios:
 
 ```sh
-docker compose -f environment/docker-compose.yaml exec client bash /tests/test.sh -k "crash or hang"
+docker compose -f environment/docker-compose.yaml exec main bash /tests/test.sh -k "crash or hang"
 ```
 
-For verifier self-tests and the mutation check, see [tests/README.md](tests/README.md).
+Run the verifier's pure self-tests on the host with `make selftest`. Use
+`make down` to stop and remove the container. For the mutation check, see
+[tests/README.md](tests/README.md).

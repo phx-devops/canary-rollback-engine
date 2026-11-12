@@ -1,89 +1,102 @@
 # Golden solution — `canary-rollback-engine`
 
-The golden solution is a **static Go ingress proxy** plus a **Python controller**. `solution/solve.sh` builds the proxy from source (Go standard library only, so it builds offline with the image's `golang-go`), installs everything into `/opt/canary/bin/`, and runs `canaryctl up`. It passes all 110 tests of the verifier suite (`tests/test.sh`, reward 1), including the five isolation tests.
+The golden solution is a **Python controller driving the system nginx** (`/usr/sbin/nginx`, nginx-light 1.24). `solution/solve.sh` installs three files into `/opt/canary/bin/` and runs `canaryctl up`. It passes the full verifier suite (`tests/test.sh`, reward 1).
 
 ```
 solution/
-├── solve.sh                    # build proxy → install → bring ingress up at 100 % blue
-├── proxy/                      # Go, stdlib only
-│   ├── main.go                 # canary-proxy: weighted routing, live weights, per-backend counters
-│   ├── main_test.go            # 7 unit tests (run with -race)
-│   └── go.mod                  # go 1.22 (Ubuntu 24.04's golang-go)
-├── canary/
-│   ├── canaryctl               # CLI: up | start | status | reset; privileged launcher
-│   ├── engine.py               # rollout loop: scrape, window, stage/abort decisions, proxy watchdog
-│   └── common.py               # proxy admin client, proxy command line, status + event writers
-└── alternatives/haproxy/       # the previous HAProxy-based golden; also passes the suite
+├── solve.sh              # install → canaryctl up (nginx at 100 % blue)
+└── canary/
+    ├── canaryctl         # CLI: up | start | status | reset; privileged launcher; recovery
+    ├── engine.py         # rollout loop: tail access log, window, decisions, nginx watchdog
+    └── common.py         # durable state, nginx config + control, status, events, reconciliation
 ```
 
-This design follows the approach an external frontier-model run took. That run (Go proxy plus Python controller) passed 105 of 110 tests in a non-root sandbox but couldn't execute the five isolation tests, and its code wasn't available to us. This version was written from scratch along the same lines and validated end to end in a real network namespace.
+## 1. nginx, configured to tell the truth
 
-## 1. Ingress: `canary-proxy` (Go)
+`common.render_conf()` writes `/var/lib/canary/nginx.conf` from the durable state:
 
-- **Routing.** Smooth weighted round robin, as in nginx, gives exact, evenly interleaved proportions: at 90/10, green gets exactly 10 of every 100 requests and never two in a row.
-- **Live weights.** Weights change through a unix admin socket (`/run/canary/proxy.sock`, mode 0600) with a line-JSON protocol: `{"cmd":"set","weights":{"app-blue":90,"app-green":10}}` and `{"cmd":"stats"}`. Both weights are swapped under one lock, so there is never an instant with no eligible backend. The proxy is never restarted to change weights, and in-flight requests are unaffected.
-- **Failure attribution.** Each backend has its own `requests` and `failures` counters. A request counts once it completes, against the backend it was sent to. A failure is a 5xx answer, a refused or reset connection (the client gets 502), or no response headers within `-upstream-timeout 5s` (the client gets 504). A client that disconnects is not counted against the backend.
-- **No retries.** A failed request is never resent to the other backend. That is exactly the behaviour that hides a crashed canary behind blue (the `redispatch` mutant shows it).
-- **No upstream connection reuse** (`DisableKeepAlives`). Each request opens its own connection, so a backend that dies can't keep answering on a pooled connection.
-- **Restart-safe.** The proxy always starts from the weights on its command line (100/0 blue), and every process start gets a new random `instance` ID in `stats`, so a scraper can tell that the counters restarted.
-- **Readiness.** The pidfile is written only after both listeners are bound. SIGTERM shuts down gracefully.
-
-Seven unit tests cover these behaviours (`go test -race`), along with `go vet`: exact SWRR split and interleaving, weight validation, per-backend attribution with no retry, timeout giving 504 plus a failure, response pass-through, zero failed requests across live weight changes under concurrent load, and the admin protocol.
-
-## 2. Launcher: enter the namespace, drop everything, detach
-
-`canaryctl` is run by root from the default namespace. Every long-running process (proxy and engine) is started like this:
-
-```
-nsenter --net=/run/netns/canary -- \
-  setpriv --reuid=canary --regid=canary --clear-groups \
-          --inh-caps=-all --bounding-set=-all --no-new-privs -- \
-  setsid -f <argv>
+```nginx
+upstream apps {
+    server 127.0.0.1:9001 weight=50 max_fails=0;   # or "down" when its weight is 0
+    server 127.0.0.1:9002 weight=50 max_fails=0;
+}
+location / {
+    proxy_pass http://apps;
+    proxy_next_upstream off;
+    proxy_connect_timeout 1s;  proxy_send_timeout 5s;  proxy_read_timeout 5s;
+}
+log_format canary '$msec $upstream_addr $upstream_status $status';
 ```
 
-with stdin from `/dev/null`, output to `/var/log/canary/*.out`, and a scrubbed environment. The namespace is entered while still privileged (`setns` needs `CAP_SYS_ADMIN`), and only then are UID, GID, groups and all capability sets dropped. `setsid -f` forks into a new session with no controlling terminal, reparented to PID 1. Port 8080 is unprivileged, so the proxy needs no capability at all.
+- **`max_fails=0`** turns off passive health checking. Otherwise each worker pulls green for `fail_timeout` (10 s) after one connection error or timeout, which changes the split behind the engine's back and starves the window of green requests.
+- **`proxy_next_upstream off`**: a failed green request is never retried on blue, so the client sees the failure and the log line has exactly one upstream.
+- **`proxy_read_timeout 5s`** bounds waiting for response headers from a hung upstream. The default 60 s would hide a hang.
+- **Zero weights become `down`**, because `weight=0` is invalid in nginx.
+- **Split changes are graceful reloads** (SIGHUP to the master): new workers take the new split while old workers finish their requests. No client request fails.
+- **Unprivileged paths.** pid in `/run/canary`; temp dirs in `/var/lib/canary/nginx/*`; access and error logs in `/var/log/canary`; and `-e` so even the start-up error log is writable by `canary`.
+
+## 2. Durable state and recovery
+
+- **State.** `/var/lib/canary/state.json` survives a reboot. It holds the rollout ID, state, stage, dwell, stage entry time (wall clock), abort reason and the last window. It is written atomically, with an fsync of both the file and the directory.
+- **Write-ahead ordering.** Every decision is *persisted first, then applied to nginx, then reported* (status and event). A crash at any point leaves state that recovery can finish.
+- **`canaryctl up`** (the node agent's call after a crash or reboot):
+  1. Recreates `/run/canary` and the canary-owned files.
+  2. Renders nginx from state (the current stage's split while shifting, 100/0 for aborted or idle, 0/100 for promoted), kills any orphaned workers and starts nginx. It leaves nginx alone if a live engine owns it.
+  3. If the rollout is shifting and no engine runs, starts the engine with `--resume`. Otherwise it logs any decision the crash cut off and rewrites the status.
+- **A resumed engine** first reconciles the event log against state, logging any persisted-but-unlogged stage, abort or promotion right after the sample that triggered it. It then logs `resumed`, re-applies the stage's split, and starts with an **empty window**. Dwell is measured from the persisted stage entry time, so downtime counts, but a decision still needs five fresh samples.
+- **An abort is durable.** After a reboot, `up` brings nginx back at 100 % blue and reports `aborted`. Green gets nothing.
 
 ## 3. Engine loop (`engine.py`)
 
 ```
-write pid; baseline the proxy's counters; set 90/10; status(stage 1)
+reconcile events with state; if resumed: log "resumed"; apply the stage's split; publish status
 loop (wakes every 0.25 s):
-    if the proxy's pid is gone: restart it (100/0 blue), abort, exit
+    if nginx's master is gone (zombie-aware): persist abort → render 100/0 → kill stray workers →
+        start nginx → report → exit
     every 2.0 s on a monotonic schedule:
-        scrape stats → delta of app-green (requests, failures) since the last scrape
-            (a new proxy instance re-baselines at zero, never a negative delta)
-        append to a 5-slot window; emit a "sample" event
-        n, e = window sums; evaluated = window full and n >= 20
-        if evaluated and e/n > 5 %: set 100/0, status aborted with reason, "aborted" event, exit
-        if evaluated and stage held >= dwell: advance (or promote after 0/100), event
-        write status (atomic tmp + rename)
+        read new access-log lines; count lines whose $upstream_addr is app-green
+            (failure: $upstream_status ≥ 500 or missing; 499 = client gave up, ignored)
+        append to the 5-slot window; log "sample"
+        evaluated = window full and ≥ 20 green requests
+        if evaluated and rate > 5 %: persist abort → nginx 100/0 → report → exit
+        if evaluated and now − stage_entered_at ≥ dwell: persist → apply → log (advance or promote)
 ```
 
-- **Ratio of sums** over the five samples, never the mean of per-sample rates.
-- **Scraping, not log tailing.** The cumulative counters are differenced every 2 s, which satisfies "access logs or metrics". The engine's sample total matches app-green's own counter within the 5 % check.
-- **Abort is terminal.** The engine exits after setting 100/0, so a recovered green is never reconsidered. `canaryctl start` launches a fresh engine with a new `rollout_id` and returns once the status file shows it.
-- **Proxy watchdog.** The engine checks the proxy's pid four times a second. When it is gone, the engine is already `canary` inside the namespace, so it starts a new proxy with the same identity. That proxy serves 100 % blue, and the engine then aborts. If the proxy dies between the liveness check and a scrape, the next loop iteration handles it the same way, so the engine never crashes.
-- **Events** follow the instruction's schema. Every `sample`, `stage`, `aborted` and `promoted` line carries `rollout_id`, and a decision is always logged after the sample that triggered it.
+The access log is tailed by inode, so it is reopened if replaced. The engine starts reading at the end of the file, so a restarted engine never counts traffic from before its own window.
 
-## 4. Measured behaviour
+## 4. Launcher and isolation
 
-Final full run: **110 passed, reward 1, 8 min 25 s**, installed from scratch.
+`canaryctl` runs as root in the default namespace. Every long-running process starts as:
+
+```
+nsenter --net=/run/netns/canary -- setpriv --reuid=canary --regid=canary --clear-groups \
+        --inh-caps=-all --bounding-set=-all --no-new-privs -- …
+```
+
+followed by either `/usr/sbin/nginx -e … -c …` or `setsid -f python3 -I engine.py [--resume]`.
+
+nginx daemonises itself (its own session, no TTY). The engine gets `setsid -f`. Port 8080 needs no capability. When the engine restarts nginx after the ingress dies, nginx inherits the engine's identity.
+
+## 5. Measured behaviour
+
+Final full run: **144 passed, reward 1, 11 min 49 s**, installed from scratch.
 
 | Scenario | Outcome |
 |---|---|
-| Healthy, 3 % green, 30 % blue, bursty, no-traffic→traffic | Promoted. Stage splits within ±5 pp. Zero client errors in the healthy run. Sample totals match app-green's counter. |
-| 8 % errors at 50/50 | Aborted after **6.95 s** (limit 18). This is the minimum the rule allows: about 6.25 s for the window to cross 5 %, plus up to one sample. |
-| Crash at 90/10, window full | Aborted after **0.97 s** (limit 8). Refused connections count as failures immediately. |
-| Hang during the 0/100 bake | Aborted after **6.97 s** (limit 20): the 5 s upstream timeout plus up to one sample. |
-| Proxy SIGKILLed at 50/50 | Restarted at 100 % blue and aborted after **0.16 s** (limit 10). The new proxy runs as `canary` with no capabilities. |
-| After each abort | All traffic is on blue with no errors, and green gets nothing even after it recovers. |
-| Status and event logs | Schema-valid on every poll. Every decision follows from the logged samples. |
-| Process checks | Engine and proxy: UID/GID `canary`, no supplementary groups, all capability sets 0, `tty_nr = 0`, own session. Also checked after the proxy restart. |
+| Healthy, green 3 %, blue 30 %, bursty, no traffic → traffic | Promoted. Stage splits within ±5 pp. Zero client errors in the healthy run. Sample totals match app-green's counter. |
+| 8 % errors at 50/50 | Aborted after **6.92 s** (limit 18), with the split held at 50/50 until then. This is the minimum the rule allows (about 6.25 s plus one sample). |
+| Crash at 50/50 | Aborted after **0.92 s** (limit 8), without advancing. |
+| Hang during the 0/100 bake | Aborted after **6.91 s** (limit 20): the 5 s upstream timeout plus one sample. |
+| Ingress SIGKILLed at 50/50 | nginx restarted at 100 % blue (as `canary`, no capabilities), aborted after **0.20 s** (limit 10). |
+| Engine killed as green starts failing; `up` after 2 s | Resumed, then aborted after **12.52 s** (limit 25): the 2 s restart delay plus a fresh 10 s window. |
+| Chaos (3 engine kills + 1 reboot) | Promoted under the same ID. Split restored at 50/50 within 5 s of the post-reboot `up`. 4 `resumed` events, each stage logged once. No client errors outside the reboot outage. |
+| Abort, then reboot | Comes back `aborted` at 100 % blue. Green gets nothing. The abort is logged once. |
+| Ingress identity, before and after a reboot | Only `/usr/sbin/nginx` listens on `:8080` and holds connections to the targets. |
+| Isolation (mid-rollout, after the ingress restart, after a reboot) | Engine and every nginx process: UID/GID `canary`, no groups, all capability sets 0, no TTY, their own session. |
 
-Bugs found while building this version (fixed in both this and the HAProxy alternative): root-owned `events.jsonl` and launcher logs on a fresh container, and a killed proxy lingering as a zombie that the liveness check took for alive. See PROPOSAL.md, Revision 3.
+## 6. What an agent may do differently
 
-## 5. Valid alternatives the verifier accepts
-
-- **HAProxy** (kept in `solution/alternatives/haproxy/`): live weights via the runtime API, `retries 0` with no redispatch, `timeout server 5s`, and the access log sent to a unix datagram socket the engine reads.
-- **nginx:** weighted `upstream` with reloads, `proxy_next_upstream off`, `proxy_read_timeout 5s`, and an access log with `$upstream_addr $upstream_status`.
-- **Any home-grown proxy** in Python, Go or Bash, provided it attributes failures per backend, enforces the 5 s limit and doesn't retry. Go's `httputil.ReverseProxy` has *no* response timeout by default, so a naive Go proxy waits indefinitely on a hung green and fails the hang scenario.
+- **Telemetry:** syslog-to-unix-socket instead of tailing a file; JSON log format; any attribution scheme that keys on the upstream address.
+- **Split changes:** the nginx-plus API isn't available. Reloading is the only route, but how the config is generated and validated is free (`nginx -t` first, templating, includes).
+- **State:** SQLite or another file layout, as long as it lives somewhere a reboot doesn't wipe and decisions are persisted before they are applied.
+- **Privilege drop:** `setpriv`, `capsh`, Python `os.setns` + `setgroups`/`setresgid`/`setresuid`, or Go `unix.Setns` on a locked thread. Any method that reaches the specified `/proc` end state passes.
