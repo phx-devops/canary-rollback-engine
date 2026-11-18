@@ -8,8 +8,12 @@ subcategory = "systems"
 tags = ["canary", "progressive-delivery", "nginx", "crash-recovery", "network-namespaces", "observability", "rollback"]
 expert_time_estimate_min = 240
 junior_time_estimate_min = 900
+difficulty_explanation = "This is a hard systems task: the solution must implement an nginx ingress, a two-stage traffic sampler and rollback engine, a live status/event contract, crash and reboot recovery, and privilege isolation in a shared network namespace."
+solution_explanation = "Build an nginx ingress, a canary engine that applies 90/10, 50/50, and 0/100 stages, sample and persist rollout state under /var/lib and /var/log, resume after crashes and reboots, and expose canaryctl start/status/up/reset while dropping privileges."
+verification_explanation = "The verifier runs in the agent's root-capable container because it must inspect the live namespace and processes. It checks live traffic splits, schemas and event decisions, crash/reboot recovery, nginx-only ingress isolation, and rollout mutants across deterministic scenarios."
 
 [verifier]
+# test.sh uses the image's system-wide python3-pytest because tests must inspect the live agent container.
 # The verifier runs in the agent's root-capable container; this is not an isolation boundary.
 timeout_sec = 1800
 

@@ -32,6 +32,7 @@ def test_chaos_stages_in_order_and_held(scenario):
     r = scenario("chaos"); f = r["first"]
     t = [f.get(("stage", i)) for i in (1, 2, 3)] + [r["t_term"]]
     assert all(t) and t[0] < t[1] < t[2] < t[3], t
+    assert H.dwell_problem(H.rollout_events(r["events"], r["start"]["rid"]), DWELL) is None
     for i in range(3):
         assert t[i + 1] - t[i] >= DWELL - 1, f"stage {i + 1} held {t[i + 1] - t[i]:.1f}s < dwell"
 
@@ -55,7 +56,7 @@ def test_chaos_split_restored_after_reboot(scenario):
     t3 = r["first"].get(("stage", 3)) or r["t_reboot_up"] + 15
     recs = [x for x in r["rec"] if r["t_reboot_up"] + 5 <= x[0] < min(t3, r["t_reboot_up"] + 12)]
     g = H.green_share(recs)
-    assert g is not None and abs(g - 0.5) <= 0.07, f"green share {g} over {len(recs)} requests after the reboot"
+    assert g is not None and abs(g - 0.5) <= 0.05, f"green share {g} over {len(recs)} requests after the reboot"
 
 
 def test_chaos_no_client_errors_outside_reboot(scenario):

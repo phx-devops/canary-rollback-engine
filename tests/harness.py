@@ -59,8 +59,14 @@ def status_problem(s):
     if st != "shifting" and not (s["pid"] is None or isint(s["pid"])): return "pid must be an integer or null"
     w = s["window"]
     if not (isinstance(w, dict) and w.get("seconds") == 10 and isint(w.get("green_requests")) and isint(w.get("green_errors"))
-            and (w.get("error_rate") is None or isnum(w.get("error_rate")))):
+            and w["green_requests"] >= 0 and 0 <= w["green_errors"] <= w["green_requests"]
+            and (w["error_rate"] is None or isnum(w["error_rate"]))):
         return f"bad window {w!r}"
+    if w["green_requests"] == 0:
+        if w["error_rate"] is not None:
+            return "window with zero requests must have null error_rate"
+    elif not (isnum(w["error_rate"]) and abs(w["error_rate"] - w["green_errors"] / w["green_requests"]) <= 0.000001):
+        return "window error_rate must equal green_errors / green_requests"
     if st == "shifting" and (s["weights"] != STAGE_W[s["stage"]] or s["abort_reason"] is not None): return "shifting: weights must match the stage, abort_reason null"
     if st == "promoted" and (s["weights"] != GREEN or s["stage"] != 3 or s["abort_reason"] is not None): return "promoted: stage 3, weights 0/100, abort_reason null"
     if st == "aborted" and (s["weights"] != BLUE or not isinstance(s["abort_reason"], str) or not s["abort_reason"]): return "aborted: weights 100/0 and a non-empty abort_reason"
@@ -85,7 +91,9 @@ def parse_events(lines):
         elif t == "stage" and not (e.get("stage") in (1, 2, 3) and e.get("weights") == STAGE_W.get(e.get("stage"))):
             bad.append(f"line {i}: stage event needs stage 1-3 and that stage's weights")
         elif t == "aborted" and not (isinstance(e.get("reason"), str) and e["reason"] and isint(e.get("green_requests"))
-                                     and isint(e.get("green_errors")) and "error_rate" in e):
+                                         and isint(e.get("green_errors")) and e["green_requests"] >= 0
+                                         and 0 <= e["green_errors"] <= e["green_requests"]
+                                         and isnum(e.get("error_rate"))):
             bad.append(f"line {i}: aborted event needs reason, green_requests, green_errors, error_rate")
         elif t == "resumed" and e.get("stage") not in (1, 2, 3):
             bad.append(f"line {i}: resumed event needs stage 1-3")
@@ -96,6 +104,34 @@ def parse_events(lines):
 
 
 def rollout_events(evs, rid): return [e for e in evs if e.get("rollout_id") == rid]
+
+
+def status_window_problem(status, events):
+    """Compare a status window with the most recent five sample events in the current rollout segment."""
+    if not isinstance(status, dict) or status.get("state") == "idle":
+        return None
+    rid = status.get("rollout_id")
+    if not isinstance(rid, str) or not rid:
+        return "status lacks rollout_id for window comparison"
+    segment = []
+    for event in rollout_events(events, rid):
+        if event["type"] == "resumed":
+            segment = []
+        elif event["type"] == "sample":
+            segment.append(event)
+    last = segment[-WINDOW:]
+    n = sum(e["green_requests"] for e in last)
+    f = sum(e["green_errors"] for e in last)
+    expected = {
+        "seconds": 10,
+        "green_requests": n,
+        "green_errors": f,
+        "error_rate": f / n if n else None,
+    }
+    actual = status.get("window")
+    if actual != expected:
+        return f"status window {actual!r} does not match event log window {expected!r}"
+    return None
 
 
 def segments(mine):
@@ -153,6 +189,10 @@ def rule_problems(mine, error_abort=True):
                     probs.append(f"abort decided on window {f}/{n}")
                 elif (e["green_requests"], e["green_errors"]) != (n, f):
                     probs.append(f"abort logged {e['green_errors']}/{e['green_requests']} but window was {f}/{n}")
+                elif not isnum(e.get("error_rate")):
+                    probs.append(f"abort logged a non-numeric error_rate {e.get('error_rate')!r}")
+                elif n and abs(e["error_rate"] - f / n) > 0.000001:
+                    probs.append(f"abort logged error_rate {e['error_rate']} but window was {f}/{n}")
         prev = e
     # every evaluated breach must be followed at once by the abort
     win = []
@@ -166,6 +206,26 @@ def rule_problems(mine, error_abort=True):
             if not (nxt and nxt["type"] == "aborted"):
                 probs.append(f"breach {f}/{n} at event {i} was not acted on")
     return probs
+
+
+def dwell_problem(mine, dwell):
+    """Check that stage and promotion events preserve the original stage dwell time."""
+    stages = [(e["ts"], e["stage"]) for e in mine if e["type"] == "stage"]
+    terminal = [e for e in mine if e["type"] in ("promoted", "aborted")]
+    decisions = stages[1:] + [(terminal[0]["ts"], 4) for terminal in terminal[:1] if terminal["type"] == "promoted"]
+    if not stages:
+        return "no stage 1 event"
+    problems = []
+    for i, (start_ts, start_stage) in enumerate(stages):
+        if i + 1 < len(stages):
+            end_ts = stages[i + 1][0]
+        elif terminal and terminal[0]["type"] == "promoted":
+            end_ts = terminal[0]["ts"]
+        else:
+            continue
+        if end_ts - start_ts < dwell - 1:
+            problems.append(f"stage {start_stage} held {end_ts - start_ts:.1f}s < dwell {dwell}s")
+    return "; ".join(problems) if problems else None
 
 
 # ---------------------------------------------------------------- environment access
@@ -244,6 +304,11 @@ class Watch:
             if not s and self.allow_missing and not os.path.exists(STATUS): time.sleep(0.2); continue
             p = status_problem(s)
             if p and len(self.bad) < 5: self.bad.append(f"{p}: {s}")
+            if s and s.get("state") != "idle":
+                events, event_bad = read_events(0)
+                if not event_bad:
+                    wp = status_window_problem(s, events)
+                    if wp and len(self.bad) < 5: self.bad.append(wp)
             key = s.get("state") if s.get("state") in ("promoted", "aborted") else ("stage", s.get("stage"))
             self.first.setdefault(key, time.time()); time.sleep(0.2)
     def __enter__(self): threading.Thread(target=self.loop, daemon=True).start(); return self
@@ -360,21 +425,69 @@ def reboot():
     """Simulate a node reboot: kill every process running as canary, lose /run and /tmp beyond what
     was there when the container started. /var/lib, /var/log and /opt survive."""
     import shutil
+    import stat
     uid = pwd.getpwnam("canary").pw_uid
     for _ in range(3):
         subprocess.run(["pkill", "-9", "-u", str(uid)], capture_output=True)
         time.sleep(0.3)
+    container_start = os.stat("/proc/1").st_ctime
     try:
-        with open(BASELINE) as f: keep = set(f.read().split())
-    except OSError: keep = {"/run/netns", "/run/apps"}
+        baseline_stat = os.stat(BASELINE)
+        baseline_changed = baseline_stat.st_ctime - container_start
+        if baseline_changed > 60:
+            keep = {"/run/netns", "/run/apps"}
+        else:
+            with open(BASELINE) as f:
+                keep = set(f.read().split())
+            keep.intersection_update({"/run/netns", "/run/apps"})
+    except OSError:
+        keep = {"/run/netns", "/run/apps"}
+    trust = container_start
+    if not keep:
+        keep = {"/run/netns", "/run/apps"}
+
     for top in ("/run", "/tmp"):
         for name in os.listdir(top):
             path = f"{top}/{name}"
-            if path in keep: continue
+            if path in keep:
+                continue
             try:
                 if os.path.isdir(path) and not os.path.islink(path): shutil.rmtree(path)
                 else: os.unlink(path)
             except OSError: pass
+    for path in keep:
+        if not os.path.isdir(path) or os.path.islink(path):
+            continue
+        for root, dirs, files in os.walk(path, topdown=False):
+            for name in files:
+                entry = os.path.join(root, name)
+                try:
+                    if os.stat(entry).st_ctime > trust:
+                        os.unlink(entry)
+                except OSError:
+                    pass
+            for name in dirs:
+                entry = os.path.join(root, name)
+                try:
+                    if os.stat(entry).st_ctime > trust:
+                        shutil.rmtree(entry)
+                except OSError:
+                    pass
+        for root, dirs, _ in os.walk(path, topdown=False):
+            try:
+                if hasattr(os, "listxattr"):
+                    for attr in os.listxattr(root):
+                        if attr.startswith("trusted.") or attr.startswith("user."):
+                            os.removexattr(root, attr)
+            except (OSError, AttributeError):
+                pass
+    for name in os.listdir("/dev/shm"):
+        path = os.path.join("/dev/shm", name)
+        try:
+            if os.path.isdir(path) and not os.path.islink(path): shutil.rmtree(path)
+            else: os.unlink(path)
+        except OSError:
+            pass
 
 
 def kill_engine():

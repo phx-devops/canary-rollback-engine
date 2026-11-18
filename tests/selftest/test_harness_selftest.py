@@ -43,6 +43,8 @@ def test_status_schema_accepts(s):
     variant(GOOD_SHIFTING, pid="42"),
     variant(GOOD_SHIFTING, rollout_id=""),
     variant(GOOD_SHIFTING, window={"seconds": 10, "green_requests": 1.5, "green_errors": 0, "error_rate": 0}),
+    variant(GOOD_SHIFTING, window={"seconds": 10, "green_requests": 20, "green_errors": 21, "error_rate": 1.05}),
+    variant(GOOD_SHIFTING, window={"seconds": 10, "green_requests": 20, "green_errors": 1, "error_rate": 0.20}),
     variant(GOOD_SHIFTING, window=None),
     variant(GOOD_SHIFTING, abort_reason="should be null"),
     variant(GOOD_SHIFTING, state="aborted", weights=H.BLUE, abort_reason=""),       # abort without a reason
@@ -51,7 +53,7 @@ def test_status_schema_accepts(s):
     [],
 ], ids=["missing-key", "idle-green", "idle-rollout-id", "idle-stage", "idle-pid", "idle-window",
         "bad-state", "stage-mismatch", "weight-keys", "stage-4", "stage-bool", "pid-str",
-        "empty-rid", "float-count", "no-window", "reason-while-shifting", "abort-no-reason", "abort-not-blue",
+        "empty-rid", "float-count", "errors-over-requests", "wrong-window-rate", "no-window", "reason-while-shifting", "abort-no-reason", "abort-not-blue",
         "promoted-stage-2", "not-object"])
 def test_status_schema_rejects(s):
     assert H.status_problem(s) is not None
@@ -89,8 +91,10 @@ def test_parse_accepts_unknown_types_and_blank_lines():
     ev(1, "stage", rollout_id="r1", stage=2, weights=H.STAGE_W[1]),                    # wrong weights for stage
     ev(1, "aborted", rollout_id="r1", reason="", green_requests=1, green_errors=1, error_rate=1),
     ev(1, "aborted", rollout_id="r1", reason="x", green_requests=1, green_errors=1),    # no error_rate
+    ev(1, "aborted", rollout_id="r1", reason="x", green_requests=1, green_errors=2, error_rate=2),
+    ev(1, "aborted", rollout_id="r1", reason="x", green_requests=1, green_errors=1, error_rate="1"),
 ], ids=["not-json", "no-ts", "string-ts", "no-rid", "errors-gt-requests", "weights-list", "weights-wrong",
-        "empty-reason", "no-error-rate"])
+        "empty-reason", "no-error-rate", "errors-over-requests", "string-error-rate"])
 def test_parse_rejects(line):
     assert H.parse_events([line])[1]
 
@@ -115,6 +119,34 @@ def test_flags_stage_change_with_too_few_requests():        # the "0/0 counts as
     assert any("decided on window" in p for p in H.rule_problems(mine(lines)))
 
 
+def test_exact_5_percent_is_not_an_abort_breach():
+    lines = [stage(0, 1)] + [sample(2 * i, 20, 1) for i in range(1, 6)] + [stage(10, 2)]
+    assert H.rule_problems(mine(lines)) == []
+
+
+def test_20_request_minimum_is_evaluated_but_19_is_not():
+    at_minimum = [stage(0, 1)] + [sample(2 * i, 4) for i in range(1, 6)]
+    m = mine(at_minimum)
+    assert H.rule_problems(m) == []
+    below = [stage(0, 1)] + [sample(2 * i, 3) for i in range(1, 6)] + [stage(10, 2)]
+    assert any("decided on window" in p for p in H.rule_problems(mine(below)))
+
+
+def test_status_window_must_match_latest_five_samples():
+    events = [
+        {"type": "sample", "rollout_id": "r1", "green_requests": 20, "green_errors": 1},
+        {"type": "sample", "rollout_id": "r1", "green_requests": 20, "green_errors": 1},
+        {"type": "sample", "rollout_id": "r1", "green_requests": 20, "green_errors": 1},
+        {"type": "sample", "rollout_id": "r1", "green_requests": 20, "green_errors": 1},
+        {"type": "sample", "rollout_id": "r1", "green_requests": 20, "green_errors": 1},
+    ]
+    status = variant(GOOD_SHIFTING, window={"seconds": 10, "green_requests": 100, "green_errors": 5, "error_rate": 0.05})
+    assert H.status_window_problem(status, events) is None
+    status["window"]["green_errors"] = 6
+    status["window"]["error_rate"] = 0.06
+    assert H.status_window_problem(status, events) is not None
+
+
 def test_flags_ignored_breach():
     lines = [stage(0, 1)] + [sample(2 * i, 20, 2) for i in range(1, 7)]      # 10 % for 12 s, no abort
     assert any("not acted on" in p for p in H.rule_problems(mine(lines)))
@@ -129,6 +161,10 @@ def test_accepts_correct_abort_and_flags_premature_or_mislogged_abort():
     premature = [stage(0, 1)] + [sample(2 * i, 20, 1) for i in range(1, 6)] + [      # 5 / 100 = 5 %: not above
         ev(10, "aborted", rollout_id="r1", reason="x", green_requests=100, green_errors=5, error_rate=0.05)]
     assert H.rule_problems(mine(premature))
+
+    wrong_rate = [stage(0, 1)] + [sample(2 * i, 20, 0) for i in range(1, 5)] + [sample(10, 20, 6)] + [
+        ev(10, "aborted", rollout_id="r1", reason="x", green_requests=100, green_errors=6, error_rate=0.3)]
+    assert any("error_rate" in p for p in H.rule_problems(mine(wrong_rate)))
 
 
 def test_mean_of_ratios_engine_is_caught():
@@ -189,6 +225,14 @@ def test_decision_must_directly_follow_its_sample():
     assert H.rule_problems(mine(good)) == []
     late = [stage(0, 1)] + [sample(2 * i, 30) for i in range(1, 6)] + [resumed(11, 1), stage(11, 2)]
     assert any("does not directly follow" in p for p in H.rule_problems(mine(late)))
+
+
+def test_dwell_counts_across_restart_and_flags_reset_clock():
+    good = [stage(0, 1)] + [sample(2 * i, 30) for i in range(1, 6)] + [resumed(12, 1),
+                                                                         stage(15, 2)]
+    assert H.dwell_problem(mine(good), 15) is None
+    reset = [stage(0, 1), sample(2, 30), resumed(12, 1), stage(12, 2)]
+    assert H.dwell_problem(mine(reset), 15) is not None
 
 
 def test_recovered_decision_placed_before_resumed_is_valid():

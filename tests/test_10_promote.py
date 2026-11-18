@@ -28,6 +28,7 @@ def test_stages_in_order_and_each_held_for_dwell(scenario, name):
     t = [f.get(("stage", i)) for i in (1, 2, 3)] + [r["t_term"]]
     assert all(t), f"stages seen at {t}"
     assert t[0] < t[1] < t[2] < t[3], t
+    assert H.dwell_problem(H.rollout_events(r["events"], r["start"]["rid"]), DWELL) is None
     for i in range(3):
         assert t[i + 1] - t[i] >= DWELL - 1, f"stage {i + 1} held {t[i + 1] - t[i]:.1f}s < dwell {DWELL}s"
 
@@ -56,6 +57,7 @@ def test_up_preserves_promoted_state_and_green_traffic(scenario):
     up = r["up_after_promotion"]
     status = up["out"]
     assert up["rc"] == 0, up["stderr"]
+    assert isinstance(status, dict), f"`canaryctl up` did not print JSON status: {up['stderr']}"
     assert status["state"] == "promoted" and status["rollout_id"] == r["start"]["rid"], status
     assert status["weights"] == H.GREEN
     after_up = [item for item in r["rec"] if up["t_done"] <= item[0] < up["t_done"] + 2]
