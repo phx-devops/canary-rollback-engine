@@ -57,24 +57,30 @@ status = {"rollout_id": rid, "pid": os.getpid(), "state": "shifting", "abort_rea
 
 def totals(): return sum(x[0] for x in window), sum(x[1] for x in window)
 
+def win(n, e):
+    """The status window: exactly the totals of the last five samples, error_rate = errors / requests."""
+    return {"seconds": 10, "green_requests": n, "green_errors": e, "error_rate": e / n if n else None}
+
 def publish(n, e):
-    w = {"seconds": 10, "green_requests": n, "green_errors": e, "error_rate": round(e / n, 5) if n else None}
+    """Write the status. Always called BEFORE the event it corresponds to: the verifier reads the status
+    and then the event log, so status-then-event is the order that never shows a stale window."""
+    w = win(n, e)
     status.update(state=st["state"], stage=st["stage"], abort_reason=st["abort_reason"], window=w,
                   weights=W(*STAGES[st["stage"]]) if st["state"] == "shifting" else (W(100, 0) if st["state"] == "aborted" else W(0, 100)))
     write_status(status); return w
 
 def abort(reason, n, e):
-    w = {"seconds": 10, "green_requests": n, "green_errors": e, "error_rate": round(e / n, 5) if n else None}
-    st.update(state="aborted", abort_reason=reason, window=w); save_state(st)     # 1. durable decision
+    st.update(state="aborted", abort_reason=reason, window=win(n, e)); save_state(st)  # 1. durable decision
     apply(st)                                                                     # 2. nginx -> 100/0
     publish(n, e)                                                                 # 3. report
     event({"type": "aborted", "rollout_id": rid, "reason": reason, "green_requests": n, "green_errors": e,
-           "error_rate": w["error_rate"]})
+           "error_rate": e / n if n else 0.0})
 
 # Start-up: finish any decision a crash cut off, then announce the (re)start.
 reconcile_events(st)
+publish(0, 0)
 if a.resume: event({"type": "resumed", "rollout_id": rid, "stage": st["stage"]})
-apply(st); publish(0, 0)
+apply(st)
 
 nxt = time.monotonic() + PERIOD
 while True:
@@ -82,29 +88,29 @@ while True:
         # The ingress died under a running engine: abort, then bring nginx back at 100 % blue.
         n, e = totals()
         st.update(state="aborted", abort_reason="ingress exited during the rollout; restarted at 100% app-blue",
-                  window={"seconds": 10, "green_requests": n, "green_errors": e, "error_rate": round(e / n, 5) if n else None})
+                  window=win(n, e))
         save_state(st); write_conf(100, 0); kill_stray_nginx(os.getuid()); start_nginx()
         publish(n, e)
         event({"type": "aborted", "rollout_id": rid, "reason": st["abort_reason"], "green_requests": n,
-               "green_errors": e, "error_rate": st["window"]["error_rate"]})
+               "green_errors": e, "error_rate": e / n if n else 0.0})
         break
     if time.monotonic() < nxt:
         time.sleep(min(WATCH, max(0, nxt - time.monotonic()))); continue
     nxt += PERIOD
     req, err = count(tail.lines()); window.append((req, err))
-    event({"type": "sample", "rollout_id": rid, "green_requests": req, "green_errors": err})
     n, e = totals()
+    publish(n, e)
+    event({"type": "sample", "rollout_id": rid, "green_requests": req, "green_errors": err})
     evaluated = len(window) == WINDOW_SAMPLES and n >= MIN_REQ
     if evaluated and e / n > THRESHOLD:
         abort(f"app-green error rate {e / n:.2%} > 5% over 10s ({e}/{n})", n, e); break
     if evaluated and time.time() - st["stage_entered_at"] >= st["dwell"]:
-        w = {"seconds": 10, "green_requests": n, "green_errors": e, "error_rate": round(e / n, 5)}
         if st["stage"] == 3:
-            st.update(state="promoted", window=w); save_state(st)
+            st.update(state="promoted", window=win(n, e)); save_state(st)
             publish(n, e); event({"type": "promoted", "rollout_id": rid}); break
-        st.update(stage=st["stage"] + 1, stage_entered_at=time.time(), window=w); save_state(st)
-        apply(st)
+        st.update(stage=st["stage"] + 1, stage_entered_at=time.time(), window=win(n, e)); save_state(st)
+        apply(st); publish(n, e)
         event({"type": "stage", "rollout_id": rid, "stage": st["stage"], "weights": W(*STAGES[st["stage"]])})
-    st["window"] = publish(n, e)
+    st["window"] = win(n, e)
 try: os.unlink(ENGINE_PID)
 except OSError: pass

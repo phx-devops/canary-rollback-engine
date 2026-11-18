@@ -139,7 +139,7 @@ present; extra keys are allowed.
 | `stage` | 1, 2, 3 or null | the current stage, or the last one reached; null when `idle` |
 | `weights` | object | `{"app-blue": <int>, "app-green": <int>}`, the split being served |
 | `pid` | integer or null | the engine's process ID while `shifting`; null or the last engine's ID otherwise |
-| `window` | object or null | `{"seconds": 10, "green_requests": <int>, "green_errors": <int>, "error_rate": <number or null>}`; null when `idle` |
+| `window` | object or null | `{"seconds": 10, "green_requests": <int>, "green_errors": <int>, "error_rate": <number or null>}`; null only when `idle`; shifting, promoted, and aborted states report the current or last rollout window |
 | `abort_reason` | string or null | non-empty when `aborted`; null otherwise |
 
 `weights` is `{"app-blue": 100, "app-green": 0}` when `idle` or `aborted`, matches the current
@@ -206,3 +206,5 @@ status file every 0.2 s. The **abort time** is the first moment it shows `aborte
   namespace, which must include the `:8080` listeners and, while shifting, the engine. The
   `:8080` listeners and every process holding a connection to a target must be
   `/usr/sbin/nginx`.
+
+You have 28800 seconds to complete this task. Do not cheat by using online solutions or hints specific to this task.

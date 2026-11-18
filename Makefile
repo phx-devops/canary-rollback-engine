@@ -8,7 +8,7 @@ HARBOR ?= harbor
 HARBOR_ARGS ?=
 HARBOR_ENV ?= $(DOCKER)
 
-.PHONY: all check-runtime build up install run test selftest shell down harbor-oracle harbor-nop oracle nop
+.PHONY: all check-runtime build up install run test selftest shell down harbor-oracle harbor-nop oracle nop clean
 
 all: test
 
@@ -59,6 +59,12 @@ shell: up
 
 down:
 	$(DC) down
+
+clean:
+	find "$(CURDIR)" -type d -name '__pycache__' -prune -exec rm -rf -- {} +
+	find "$(CURDIR)" -type d \( -name '.pytest_cache' -o -name '.mypy_cache' -o -name '.ruff_cache' -o -name 'htmlcov' \) -prune -exec rm -rf -- {} +
+	rm -rf -- "$(CURDIR)/build" "$(CURDIR)/dist" "$(CURDIR)/output" "$(CURDIR)/outputs" "$(CURDIR)/jobs" "$(CURDIR)/trials"
+	rm -f -- "$(CURDIR)/.coverage" "$(CURDIR)/coverage.xml" "$(CURDIR)/junit.xml"
 
 harbor-oracle: check-harbor 
 	"$(HARBOR)" run -p . -a oracle -e "$(HARBOR_ENV)"

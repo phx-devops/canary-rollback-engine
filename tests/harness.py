@@ -212,7 +212,6 @@ def dwell_problem(mine, dwell):
     """Check that stage and promotion events preserve the original stage dwell time."""
     stages = [(e["ts"], e["stage"]) for e in mine if e["type"] == "stage"]
     terminal = [e for e in mine if e["type"] in ("promoted", "aborted")]
-    decisions = stages[1:] + [(terminal[0]["ts"], 4) for terminal in terminal[:1] if terminal["type"] == "promoted"]
     if not stages:
         return "no stage 1 event"
     problems = []
@@ -442,7 +441,14 @@ def reboot():
             keep.intersection_update({"/run/netns", "/run/apps"})
     except OSError:
         keep = {"/run/netns", "/run/apps"}
-    trust = container_start
+    # Anything in the kept directories that is newer than the targets' own admin sockets (created by the
+    # entrypoint before the agent ran) was planted later and is lost. /proc/1's ctime is not a reliable
+    # container start time: procfs sets it when the inode is first looked up, which can precede the
+    # sockets (and then the reboot would delete the targets' sockets) or come much later.
+    try:
+        trust = max(os.stat(f"/run/apps/{app}.sock").st_ctime for app in ("app-blue", "app-green")) + 1
+    except OSError:
+        trust = container_start
     if not keep:
         keep = {"/run/netns", "/run/apps"}
 

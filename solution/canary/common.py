@@ -176,9 +176,10 @@ def reconcile_events(st):
     for k in range(1, (st["stage"] or 0) + 1):
         if k not in have: event({"type": "stage", "rollout_id": rid, "stage": k, "weights": W(*STAGES[k])})
     types = {e.get("type") for e in mine}
-    w = st["window"] or {"green_requests": 0, "green_errors": 0, "error_rate": None}
+    w = st["window"] or {"green_requests": 0, "green_errors": 0}
+    n, e = w["green_requests"], w["green_errors"]
     if st["state"] == "aborted" and "aborted" not in types:
-        event({"type": "aborted", "rollout_id": rid, "reason": st["abort_reason"], "green_requests": w["green_requests"],
-               "green_errors": w["green_errors"], "error_rate": w["error_rate"]})
+        event({"type": "aborted", "rollout_id": rid, "reason": st["abort_reason"], "green_requests": n,
+               "green_errors": e, "error_rate": e / n if n else 0.0})
     if st["state"] == "promoted" and "promoted" not in types:
         event({"type": "promoted", "rollout_id": rid})

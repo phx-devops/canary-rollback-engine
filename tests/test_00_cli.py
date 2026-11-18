@@ -50,6 +50,12 @@ def test_start_accepts_dwell_10():
 
 
 def test_start_without_dwell_uses_30_second_default():
+    # A rollout only advances on an evaluated window (>= 20 app-green requests), so send traffic.
+    with H.Load(lambda t: 60):
+        _default_dwell_check()
+
+
+def _default_dwell_check():
     try:
         p, elapsed = H.ctl("start")
         out = H.last_json(p)
@@ -95,13 +101,24 @@ def test_start_replaces_active_rollout_and_reset_stops_it():
         second_status = H.last_json(second)
         assert second.returncode == 0 and H.status_problem(second_status) is None, second.stderr[-300:]
         second_pid = second_status["pid"]
+        try:
+            replaced_offset = H.os.path.getsize(H.EVENTS)      # the first rollout may sample until it is replaced
+        except OSError:
+            replaced_offset = 0
         assert second_status["rollout_id"] != first_status["rollout_id"]
         assert H.process_alive(second_pid), "second start did not return a live engine pid"
-        time.sleep(2)
+        # the first sample is due 2 s after the engine starts: wait up to 4 s for it rather than racing it
+        deadline = time.monotonic() + 4
+        while True:
+            events, bad = H.read_events(start_offset)
+            if any(e.get("rollout_id") == second_status["rollout_id"] and e["type"] == "sample" for e in events) \
+                    or time.monotonic() > deadline:
+                break
+            time.sleep(0.2)
 
-        events, bad = H.read_events(start_offset)
         assert not bad, bad[:3]
-        old_samples = [e for e in events if e.get("rollout_id") == first_rid and e["type"] == "sample"]
+        after_replace, _ = H.read_events(replaced_offset)
+        old_samples = [e for e in after_replace if e.get("rollout_id") == first_rid and e["type"] == "sample"]
         assert not old_samples, "replaced rollout continued sampling"
         new_samples = [e for e in events if e.get("rollout_id") == second_status["rollout_id"] and e["type"] == "sample"]
         assert new_samples, "replacement rollout did not sample"
