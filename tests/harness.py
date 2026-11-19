@@ -134,6 +134,22 @@ def status_window_problem(status, events):
     return None
 
 
+def status_event_snapshot(offset, attempts=5):
+    """Read status and events until their latest rollout window agrees or retries are exhausted."""
+    snapshot = None
+    for attempt in range(attempts):
+        events, event_bad = read_events(offset)
+        current = status()
+        status_bad = status_problem(current)
+        window_bad = status_window_problem(current, events) if not event_bad and not status_bad else None
+        snapshot = current, events, event_bad, status_bad, window_bad
+        if not event_bad and not status_bad and not window_bad:
+            break
+        if attempt + 1 < attempts:
+            time.sleep(0.05)
+    return snapshot
+
+
 def segments(mine):
     """Sample runs of one engine lifetime: a `resumed` event starts a new segment."""
     segs = [[]]
@@ -275,7 +291,9 @@ def green_share(recs):
 
 class Load:
     """Open-loop load generator: a new connection per request; records (sent, done, status, X-App)."""
-    def __init__(self, rps): self.rps, self.rec, self.run = rps, [], True; self.pool = ThreadPoolExecutor(800)
+    def __init__(self, rps):
+        self.rps, self.rec, self.run = rps, [], True
+        self.pool, self.thread = ThreadPoolExecutor(800), None
     def one(self):
         t0, st, app = time.time(), -1, None
         try:
@@ -289,29 +307,37 @@ class Load:
             r = self.rps(time.time())
             if r <= 0: time.sleep(0.05); nxt = time.time(); continue
             nxt += 1.0 / r; self.pool.submit(self.one); time.sleep(max(0, nxt - time.time()))
-    def __enter__(self): threading.Thread(target=self.loop, daemon=True).start(); return self
-    def __exit__(self, *a): self.run = False; self.pool.shutdown(wait=True)
+    def __enter__(self):
+        self.thread = threading.Thread(target=self.loop, daemon=True)
+        self.thread.start()
+        return self
+    def __exit__(self, *a):
+        self.run = False
+        if self.thread: self.thread.join()
+        self.pool.shutdown(wait=True)
     def window(self, t0, t1): return [r for r in self.rec if t0 <= r[0] < t1]
 
 
 class Watch:
     """Poll the status file every 0.2 s: validate it and record when each stage/terminal state first appears."""
-    def __init__(self, allow_missing=False): self.first, self.run, self.bad, self.allow_missing = {}, True, [], allow_missing
+    def __init__(self, allow_missing=False):
+        self.first, self.run, self.bad, self.allow_missing = {}, True, [], allow_missing
+        self.thread = None
     def loop(self):
         while self.run:
             s = status()
             if not s and self.allow_missing and not os.path.exists(STATUS): time.sleep(0.2); continue
             p = status_problem(s)
             if p and len(self.bad) < 5: self.bad.append(f"{p}: {s}")
-            if s and s.get("state") != "idle":
-                events, event_bad = read_events(0)
-                if not event_bad:
-                    wp = status_window_problem(s, events)
-                    if wp and len(self.bad) < 5: self.bad.append(wp)
             key = s.get("state") if s.get("state") in ("promoted", "aborted") else ("stage", s.get("stage"))
             self.first.setdefault(key, time.time()); time.sleep(0.2)
-    def __enter__(self): threading.Thread(target=self.loop, daemon=True).start(); return self
-    def __exit__(self, *a): self.run = False
+    def __enter__(self):
+        self.thread = threading.Thread(target=self.loop, daemon=True)
+        self.thread.start()
+        return self
+    def __exit__(self, *a):
+        self.run = False
+        if self.thread: self.thread.join()
     def wait(self, key, timeout):
         end = time.time() + timeout
         while time.time() < end:

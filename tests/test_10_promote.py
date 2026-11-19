@@ -83,7 +83,16 @@ def test_notraffic_holds_at_stage_1(scenario):
 
 @pytest.mark.parametrize("name", ALL)
 def test_status_file_matched_schema_on_every_poll(scenario, name):
-    assert not scenario(name)["status_bad"], scenario(name)["status_bad"][:2]
+    bad = scenario(name)["status_bad"]
+    assert not bad, bad[:2]
+
+
+@pytest.mark.parametrize("name", ALL)
+def test_final_status_window_matches_sample_events(scenario, name):
+    r = scenario(name)
+    rid = r["start"]["rid"]
+    p = H.status_window_problem(r["final_status"], H.rollout_events(r["events"], rid))
+    assert p is None, p
 
 
 @pytest.mark.parametrize("name", ALL)

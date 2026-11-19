@@ -26,19 +26,41 @@ def _start():
             "rid": out.get("rollout_id") if isinstance(out, dict) else None}
 
 
+def _finish_rollout(r, load, watch, events_offset):
+    status, events, event_bad, status_bad, window_bad = H.status_event_snapshot(events_offset)
+    r.update(rec=load.rec, first=dict(watch.first), status_bad=list(watch.bad),
+             final_status=status, events=events, event_bad=event_bad)
+    if status_bad: r["status_bad"].append(status_bad)
+    if window_bad: r["status_bad"].append(window_bad)
+
+
 def _bursty():
     """4 s at 10 rps with app-green failing 40 %, then 6 s at 200 rps clean. The true 10 s ratio stays
     around 1-2 %; averaging per-sample percentages exceeds 5 % at every sampling alignment."""
     def rps(t): return 10 if (t % 10) < 4 else 200
-    def toggler():
+    def toggler(stop):
         end, low = time.time() + 4 * DWELL + 40, None
-        while time.time() < end and H.status().get("state") not in ("promoted", "aborted"):
-            now_low = (time.time() % 10) < 4
-            if now_low != low:
-                H.appctl("app-green", cmd="fault", mode="ratio" if now_low else "none", rate=0.4); low = now_low
-            time.sleep(0.02)
-        H.appctl("app-green", cmd="fault", mode="none")
-    return rps, lambda: threading.Thread(target=toggler, daemon=True).start()
+        try:
+            while not stop.is_set() and time.time() < end and H.status().get("state") not in ("promoted", "aborted"):
+                now_low = (time.time() % 10) < 4
+                if now_low != low:
+                    H.appctl("app-green", cmd="fault", mode="ratio" if now_low else "none", rate=0.4); low = now_low
+                stop.wait(0.02)
+        finally:
+            H.appctl("app-green", cmd="fault", mode="none")
+    def start_toggler():
+        stop = threading.Event()
+        thread = threading.Thread(target=toggler, args=(stop,), daemon=True)
+        thread.start()
+        return stop, thread
+    return rps, start_toggler
+
+
+def _stop_toggler(toggler):
+    if toggler:
+        stop, thread = toggler
+        stop.set()
+        thread.join()
 
 
 def run_promote(name, events_offset):
@@ -51,16 +73,18 @@ def run_promote(name, events_offset):
     r = {"name": name, "proc": None}
     with H.Load(rps) as L, H.Watch() as W:
         time.sleep(2); r["start"] = _start()
-        if extra: extra()
-        if name == "healthy": time.sleep(4); r["proc"] = H.proc_snapshot()
-        r["term"], r["t_term"] = W.wait_terminal(4 * DWELL + 40)
-        r["green_truth"] = H.appctl("app-green", cmd="stats")["requests"]
-        if name == "healthy" and r["term"] == "promoted":
-            r["up_after_promotion"] = _up()
-            time.sleep(2)
-        time.sleep(3)
-    r.update(rec=L.rec, first=dict(W.first), status_bad=W.bad, final_status=H.status())
-    r["events"], r["event_bad"] = H.read_events(events_offset)
+        toggler = extra() if extra else None
+        try:
+            if name == "healthy": time.sleep(4); r["proc"] = H.proc_snapshot()
+            r["term"], r["t_term"] = W.wait_terminal(4 * DWELL + 40)
+            r["green_truth"] = H.appctl("app-green", cmd="stats")["requests"]
+            if name == "healthy" and r["term"] == "promoted":
+                r["up_after_promotion"] = _up()
+                time.sleep(2)
+            time.sleep(3)
+        finally:
+            _stop_toggler(toggler)
+    _finish_rollout(r, L, W, events_offset)
     return r
 
 
@@ -70,8 +94,7 @@ def run_notraffic(events_offset):
         r["start"] = _start(); time.sleep(2 * DWELL + 5); r["status_idle_traffic"] = H.status()
         with H.Load(lambda t: 60) as L:
             r["term"], r["t_term"] = W.wait_terminal(4 * DWELL + 40)
-    r.update(rec=L.rec, first=dict(W.first), status_bad=W.bad, final_status=H.status())
-    r["events"], r["event_bad"] = H.read_events(events_offset)
+    _finish_rollout(r, L, W, events_offset)
     return r
 
 
@@ -104,8 +127,7 @@ def run_abort(name, events_offset):
                 time.sleep(20); r["c1"] = H.appctl("app-green", cmd="stats")["requests"]
         else:
             r["term"] = r["t_term"] = r["t_fault"] = None
-    r.update(rec=L.rec, first=dict(W.first), status_bad=W.bad, final_status=H.status())
-    r["events"], r["event_bad"] = H.read_events(events_offset)
+    _finish_rollout(r, L, W, events_offset)
     return r
 
 
@@ -127,8 +149,7 @@ def run_chaos(events_offset):
         r["term"], r["t_term"] = W.wait_terminal(3 * DWELL + 60)
         r["green_truth"] = H.appctl("app-green", cmd="stats")["requests"]
         time.sleep(3)
-    r.update(rec=L.rec, first=dict(W.first), status_bad=W.bad, final_status=H.status())
-    r["events"], r["event_bad"] = H.read_events(events_offset)
+    _finish_rollout(r, L, W, events_offset)
     return r
 
 
@@ -148,8 +169,7 @@ def run_abort_reboot(events_offset):
                 time.sleep(15); r["c1"] = H.appctl("app-green", cmd="stats")["requests"]
         else:
             r["term"] = r["t_term"] = None
-    r.update(rec=L.rec, first=dict(W.first), status_bad=W.bad, final_status=H.status())
-    r["events"], r["event_bad"] = H.read_events(events_offset)
+    _finish_rollout(r, L, W, events_offset)
     return r
 
 
@@ -167,7 +187,7 @@ def run_ingress_check(events_offset):
         for t in ts: t.start()
         time.sleep(1.0); probs = H.ingress_problems(1.5)
         H.appctl("app-blue", cmd="fault", mode="none")
-        for t in ts: t.join(8)
+        for t in ts: t.join()
         return probs
     H.fresh(); r = {"name": "ingress"}
     r["before"] = probe()

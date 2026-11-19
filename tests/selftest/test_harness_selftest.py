@@ -147,6 +147,20 @@ def test_status_window_must_match_latest_five_samples():
     assert H.status_window_problem(status, events) is not None
 
 
+def test_status_event_snapshot_retries_transient_mismatch(monkeypatch):
+    samples = [{"type": "sample", "rollout_id": "r1", "green_requests": 30, "green_errors": 0}
+               for _ in range(5)]
+    snapshots = iter([([], []), (samples, [])])
+    monkeypatch.setattr(H, "read_events", lambda _: next(snapshots))
+    monkeypatch.setattr(H, "status", lambda: GOOD_SHIFTING)
+
+    status, events, event_bad, status_bad, window_bad = H.status_event_snapshot(0)
+
+    assert status == GOOD_SHIFTING
+    assert events == samples
+    assert not event_bad and status_bad is None and window_bad is None
+
+
 def test_flags_ignored_breach():
     lines = [stage(0, 1)] + [sample(2 * i, 20, 2) for i in range(1, 7)]      # 10 % for 12 s, no abort
     assert any("not acted on" in p for p in H.rule_problems(mine(lines)))
@@ -265,3 +279,18 @@ def test_terminal_flags_duplicate_stage_and_wrong_resumed_stage():
 def test_resumed_event_schema():
     assert H.parse_events([ev(1, "resumed", rollout_id="r1")])[1]
     assert not H.parse_events([resumed(1, 2)])[1]
+
+
+def test_load_context_joins_producer_thread():
+    load = H.Load(lambda _: 0)
+    with load:
+        thread = load.thread
+    assert thread is not None and not thread.is_alive()
+
+
+def test_watch_context_joins_polling_thread(monkeypatch):
+    monkeypatch.setattr(H, "status", lambda: GOOD_IDLE)
+    watch = H.Watch()
+    with watch:
+        thread = watch.thread
+    assert thread is not None and not thread.is_alive()

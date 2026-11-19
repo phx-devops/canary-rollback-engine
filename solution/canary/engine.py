@@ -62,8 +62,7 @@ def win(n, e):
     return {"seconds": 10, "green_requests": n, "green_errors": e, "error_rate": e / n if n else None}
 
 def publish(n, e):
-    """Write the status. Always called BEFORE the event it corresponds to: the verifier reads the status
-    and then the event log, so status-then-event is the order that never shows a stale window."""
+    """Atomically publish the current status; the corresponding sample event is logged by the caller."""
     w = win(n, e)
     status.update(state=st["state"], stage=st["stage"], abort_reason=st["abort_reason"], window=w,
                   weights=W(*STAGES[st["stage"]]) if st["state"] == "shifting" else (W(100, 0) if st["state"] == "aborted" else W(0, 100)))

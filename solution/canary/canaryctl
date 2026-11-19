@@ -82,7 +82,8 @@ def up():
         if not engine_pid(): launch_engine(resume=True)
     else:
         reconcile_events(st)                       # a decision the crash cut off still gets logged once
-        write_status(status_from_state(st, pid=None)); own(STATUS)
+        if read_status().get("rollout_id") != st["rollout_id"] or not os.path.exists(STATUS):
+            write_status(status_from_state(st, pid=None)); own(STATUS)
 
 def new_state(**kw): return {**IDLE, **kw}
 
