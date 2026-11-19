@@ -7,8 +7,14 @@ DC = $(COMPOSE) -f $(COMPOSE_FILE)
 HARBOR ?= harbor
 HARBOR_ARGS ?=
 HARBOR_ENV ?= $(DOCKER)
+ZIP ?= zip
+UNZIP ?= unzip
+PACKAGE_DIR ?= dist
+SOLUTION_ARCHIVE ?= $(PACKAGE_DIR)/canary-rollback-engine-solution.zip
+GOLDEN_ARCHIVE ?= $(PACKAGE_DIR)/canary-rollback-engine-golden.zip
+ZIP_EXCLUDES = -x '*/__pycache__/*' '*.pyc' '*/.pytest_cache/*' '.DS_Store' '*/.DS_Store'
 
-.PHONY: all check-runtime build up install run test selftest shell down harbor-oracle harbor-nop oracle nop clean
+.PHONY: all check-runtime build up install run test selftest shell down harbor-oracle harbor-nop oracle nop clean package-solution package-golden package-first-solution package-golden-solution
 
 all: test
 
@@ -63,8 +69,40 @@ down:
 clean:
 	find "$(CURDIR)" -type d -name '__pycache__' -prune -exec rm -rf -- {} +
 	find "$(CURDIR)" -type d \( -name '.pytest_cache' -o -name '.mypy_cache' -o -name '.ruff_cache' -o -name 'htmlcov' \) -prune -exec rm -rf -- {} +
-	rm -rf -- "$(CURDIR)/build" "$(CURDIR)/dist" "$(CURDIR)/output" "$(CURDIR)/outputs" "$(CURDIR)/jobs" "$(CURDIR)/trials"
+	rm -rf -- "$(CURDIR)/build" "$(CURDIR)/dist" "$(CURDIR)/output" "$(CURDIR)/outputs"
 	rm -f -- "$(CURDIR)/.coverage" "$(CURDIR)/coverage.xml" "$(CURDIR)/junit.xml"
+
+package-solution:
+	mkdir -p "$(PACKAGE_DIR)"
+	rm -f -- "$(SOLUTION_ARCHIVE)"
+	$(ZIP) -r -X -q "$(abspath $(SOLUTION_ARCHIVE))" Makefile README.md instruction.md task.toml environment solution $(ZIP_EXCLUDES)
+	$(UNZIP) -tq "$(abspath $(SOLUTION_ARCHIVE))"
+	@archive="$$($(UNZIP) -Z1 "$(abspath $(SOLUTION_ARCHIVE))")"; \
+	if printf '%s\n' "$$archive" | grep -q '^tests/'; then \
+		echo "Solution archive must not contain verifier tests." >&2; exit 1; \
+	fi
+
+package-golden: package-solution
+	rm -f -- "$(GOLDEN_ARCHIVE)"
+	$(ZIP) -r -X -q "$(abspath $(GOLDEN_ARCHIVE))" Makefile README.md instruction.md task.toml environment solution tests $(ZIP_EXCLUDES)
+	$(UNZIP) -tq "$(abspath $(GOLDEN_ARCHIVE))"
+	@archive="$$($(UNZIP) -Z1 "$(abspath $(GOLDEN_ARCHIVE))")"; \
+	for required in instruction.md task.toml environment/Dockerfile environment/docker-compose.yaml \
+		solution/solve.sh tests/test.sh tests/conftest.py tests/harness.py tests/scenarios.py \
+		tests/test_00_cli.py tests/test_10_promote.py tests/test_20_rollback.py \
+		tests/test_25_recovery.py tests/test_30_isolation.py tests/test_90_final.py \
+		tests/selftest/test_harness_selftest.py tests/mutants/mutate.py tests/mutants/run_mutants.sh; do \
+		if ! printf '%s\n' "$$archive" | grep -Fqx "$$required"; then \
+			echo "Golden archive is missing $$required." >&2; exit 1; \
+		fi; \
+	done; \
+	if printf '%s\n' "$$archive" | grep -Eq '(^|/)__pycache__/|\.pyc$$'; then \
+		echo "Golden archive must not contain Python cache files." >&2; exit 1; \
+	fi
+
+package-first-solution: package-solution
+
+package-golden-solution: package-golden
 
 harbor-oracle: check-harbor 
 	"$(HARBOR)" run -p . -a oracle -e "$(HARBOR_ENV)"

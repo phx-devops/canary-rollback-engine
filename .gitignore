@@ -2,3 +2,5 @@
 **.DS_Store
 jobs/**
 trials/**
+tests/**
+dist/**
