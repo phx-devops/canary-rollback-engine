@@ -6,6 +6,7 @@ from harness import DWELL
 
 # fault-onset -> abort deadline (seconds), from instruction.md
 ABORT_DEADLINE = {"green8": 18, "crash": 8, "hang": 20, "proxykill": 10, "killfault": 25}
+NO_TRAFFIC_PROMOTION_TIMEOUT = 2 * DWELL + 2 * H.WINDOW + 60  # stages 2-3, one 10s sample window, and 60s margin
 # seconds after the stage is first seen before the fault starts. The crash waits until the 10 s window
 # holds mostly stage-2 traffic, and still leaves a correct engine two full samples (4 s) before the
 # 15 s dwell expires, so it always aborts before it could advance.
@@ -30,21 +31,34 @@ def _finish_rollout(r, load, watch, events_offset):
     status, events, event_bad, status_bad, window_bad = H.status_event_snapshot(events_offset)
     r.update(rec=load.rec, first=dict(watch.first), status_bad=list(watch.bad),
              final_status=status, events=events, event_bad=event_bad)
+    if watch.terminal_wait_diagnostic:
+        samples = [e for e in H.rollout_events(events, r["start"]["rid"]) if e["type"] == "sample"]
+        r["terminal_wait"] = {
+            **watch.terminal_wait_diagnostic,
+            "final_status": status,
+            "latest_sample_ts": samples[-1]["ts"] if samples else None,
+        }
     if status_bad: r["status_bad"].append(status_bad)
     if window_bad: r["status_bad"].append(window_bad)
 
 
 def _bursty():
-    """4 s at 10 rps with app-green failing 40 %, then 6 s at 200 rps clean. The true 10 s ratio stays
-    around 1-2 %; averaging per-sample percentages exceeds 5 % at every sampling alignment."""
-    def rps(t): return 10 if (t % 10) < 4 else 200
+    """Inject two low-volume, high-error samples at stage 2, diluted by the preceding clean traffic."""
+    burst_start = [None]
+    burst_duration = 3.7
+    def rps(_):
+        started = burst_start[0]
+        return 5 if started is not None and time.monotonic() - started < burst_duration else 200
     def toggler(stop):
-        end, low = time.time() + 4 * DWELL + 40, None
         try:
-            while not stop.is_set() and time.time() < end and H.status().get("state") not in ("promoted", "aborted"):
-                now_low = (time.time() % 10) < 4
-                if now_low != low:
-                    H.appctl("app-green", cmd="fault", mode="ratio" if now_low else "none", rate=0.4); low = now_low
+            while not stop.is_set():
+                state = H.status()
+                if state.get("state") in ("promoted", "aborted"): return
+                if state.get("state") == "shifting" and state.get("stage") == 2:
+                    H.appctl("app-green", cmd="fault", mode="ratio", rate=0.4)
+                    burst_start[0] = time.monotonic()
+                    stop.wait(burst_duration)
+                    return
                 stop.wait(0.02)
         finally:
             H.appctl("app-green", cmd="fault", mode="none")
@@ -93,7 +107,7 @@ def run_notraffic(events_offset):
     with H.Watch() as W:
         r["start"] = _start(); time.sleep(2 * DWELL + 5); r["status_idle_traffic"] = H.status()
         with H.Load(lambda t: 60) as L:
-            r["term"], r["t_term"] = W.wait_terminal(4 * DWELL + 40)
+            r["term"], r["t_term"] = W.wait_terminal(NO_TRAFFIC_PROMOTION_TIMEOUT)
     _finish_rollout(r, L, W, events_offset)
     return r
 

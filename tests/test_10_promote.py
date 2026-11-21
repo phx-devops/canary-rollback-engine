@@ -19,7 +19,10 @@ def test_start_returns_new_rollout_within_5s(scenario, name):
 @pytest.mark.parametrize("name", ALL)
 def test_rollout_promoted(scenario, name):
     r = scenario(name)
-    assert r["term"] == "promoted", f"terminal state {r['term']}; status {r['final_status']}"
+    assert r["term"] == "promoted", (
+        f"terminal state {r['term']}; status {r['final_status']}; "
+        f"terminal wait diagnostics {r.get('terminal_wait')}"
+    )
 
 
 @pytest.mark.parametrize("name", PROMOTE)

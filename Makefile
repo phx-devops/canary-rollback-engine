@@ -11,11 +11,12 @@ HARBOR_ENV ?= $(DOCKER)
 ZIP ?= zip
 UNZIP ?= unzip
 PACKAGE_DIR ?= dist
+PROMPT_ARCHIVE ?= $(PACKAGE_DIR)/canary-rollback-engine-prompt.zip
 SOLUTION_ARCHIVE ?= $(PACKAGE_DIR)/canary-rollback-engine-solution.zip
 GOLDEN_ARCHIVE ?= $(PACKAGE_DIR)/canary-rollback-engine-golden.zip
 ZIP_EXCLUDES = -x '*/__pycache__/*' '*.pyc' '*/.pytest_cache/*' '.DS_Store' '*/.DS_Store'
 
-.PHONY: all check-runtime build up install run test selftest shell down harbor-oracle harbor-nop oracle nop clean package-solution package-golden package-first-solution package-golden-solution
+.PHONY: all check-runtime build up install run test selftest shell down harbor-oracle harbor-nop oracle nop clean package-prompt package-solution package-golden package-first-solution package-golden-solution
 
 all: test
 
@@ -73,7 +74,17 @@ clean:
 	rm -rf -- "$(CURDIR)/build" "$(CURDIR)/dist" "$(CURDIR)/output" "$(CURDIR)/outputs" "$(CURDIR)/dist"
 	rm -f -- "$(CURDIR)/.coverage" "$(CURDIR)/coverage.xml" "$(CURDIR)/junit.xml"
 
-package-solution:
+package-prompt:
+	mkdir -p "$(PACKAGE_DIR)"
+	rm -f -- "$(PROMPT_ARCHIVE)"
+	$(ZIP) -r -X -q "$(abspath $(PROMPT_ARCHIVE))" Makefile README.md instruction.md task.toml environment $(ZIP_EXCLUDES)
+	$(UNZIP) -tq "$(abspath $(PROMPT_ARCHIVE))"
+	@archive="$$($(UNZIP) -Z1 "$(abspath $(PROMPT_ARCHIVE))")"; \
+	if printf '%s\n' "$$archive" | grep -Eq '^(solution|tests)/'; then \
+		echo "Prompt archive must not contain the reference solution or verifier tests." >&2; exit 1; \
+	fi
+
+package-solution: package-prompt
 	mkdir -p "$(PACKAGE_DIR)"
 	rm -f -- "$(SOLUTION_ARCHIVE)"
 	$(ZIP) -r -X -q "$(abspath $(SOLUTION_ARCHIVE))" Makefile README.md instruction.md task.toml environment solution $(ZIP_EXCLUDES)

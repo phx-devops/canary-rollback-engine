@@ -49,13 +49,13 @@ def test_start_accepts_dwell_10():
         H.ctl("reset")
 
 
-def test_start_without_dwell_uses_30_second_default():
+def test_start_without_dwell_uses_30_second_default(events_offset):
     # A rollout only advances on an evaluated window (>= 20 app-green requests), so send traffic.
     with H.Load(lambda t: 60):
-        _default_dwell_check()
+        _default_dwell_check(events_offset)
 
 
-def _default_dwell_check():
+def _default_dwell_check(events_offset):
     try:
         p, elapsed = H.ctl("start")
         out = H.last_json(p)
@@ -65,7 +65,7 @@ def _default_dwell_check():
         first = second = None
         end = time.monotonic() + 50
         while time.monotonic() < end:
-            events, bad = H.read_events(0)
+            events, bad = H.read_events(events_offset)
             assert not bad, bad[:3]
             mine = H.rollout_events(events, rid)
             for event in mine:
@@ -107,6 +107,7 @@ def test_start_replaces_active_rollout_and_reset_stops_it():
             replaced_offset = 0
         assert second_status["rollout_id"] != first_status["rollout_id"]
         assert H.process_alive(second_pid), "second start did not return a live engine pid"
+        assert _wait_process_exit(first_pid, 2), "replacement left the first rollout engine running"
         # the first sample is due 2 s after the engine starts: wait up to 4 s for it rather than racing it
         deadline = time.monotonic() + 4
         while True:
@@ -138,6 +139,13 @@ def test_start_replaces_active_rollout_and_reset_stops_it():
     assert not [e for e in events if e["type"] == "sample"], "reset left a rollout sampling"
     assert not H.process_alive(first_pid), "reset left the first rollout engine running"
     assert not H.process_alive(second_pid), "reset left the second rollout engine running"
+
+
+def _wait_process_exit(pid, timeout):
+    deadline = time.monotonic() + timeout
+    while H.process_alive(pid) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    return not H.process_alive(pid)
 
 
 def test_ingress_serves_blue_when_idle():

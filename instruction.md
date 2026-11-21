@@ -120,11 +120,12 @@ last line of stdout.
   again must be harmless.
 - `canaryctl start [--dwell SECONDS]`: start a new rollout with a new `rollout_id` (default dwell
   30 s). Values below 10 must be rejected with a non-zero exit. Any rollout in progress is
-  replaced. Return within 5 seconds, printing the new rollout's status (`state` = `shifting`),
-  while the rollout continues in the background.
+  replaced, and its engine process must have exited before this command returns. Return within 5
+  seconds, printing the new rollout's status (`state` = `shifting`), while the rollout continues
+  in the background.
 - `canaryctl status`: print the current status.
 - `canaryctl reset`: stop any rollout in progress, serve 100 % `app-blue`, and set the status to
-  `idle`.
+  `idle`. The old engine process must have exited before `reset` returns.
 
 ## Status file — `/run/canary/status.json`
 
@@ -146,6 +147,10 @@ present; extra keys are allowed.
 stage while `shifting`, and is `{"app-blue": 0, "app-green": 100}` when `promoted`. Whenever a
 `canaryctl` command returns with `state` = `shifting`, `pid` is a live process.
 
+For every non-idle window, `error_rate` is `null` exactly when `green_requests` is zero.
+Otherwise it equals `green_errors / green_requests`, including before the window is eligible for
+a rollout decision.
+
 ## Event log — `/var/log/canary/events.jsonl`
 
 Append one JSON object per line. Every line has `ts` (Unix time in seconds, a number) and `type`
@@ -155,7 +160,7 @@ Append one JSON object per line. Every line has `ts` (Unix time in seconds, a nu
 |---|---|---|
 | `sample` | every 2 s while an engine is running a rollout | `rollout_id`, `green_requests`, `green_errors` (that sample's counts only) |
 | `stage` | entering a stage, including stage 1 | `rollout_id`, `stage` (1–3), `weights` (the stage's split, as in the status file) |
-| `aborted` | on abort | `rollout_id`, `reason`, `green_requests`, `green_errors` (the window totals behind the decision), `error_rate` |
+| `aborted` | on abort | `rollout_id`, `reason`, `green_requests`, `green_errors` (the window totals behind the decision), `error_rate` (`null` exactly when `green_requests` is zero; otherwise `green_errors / green_requests`) |
 | `promoted` | on promotion | `rollout_id` |
 | `resumed` | when a rollout continues after a crash or reboot | `rollout_id`, `stage` |
 

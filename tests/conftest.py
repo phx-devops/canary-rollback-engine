@@ -7,6 +7,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 import harness as H
 import scenarios as S
 
+EVENTS_OFFSET = 0
 if os.environ.get("CANARY_SELFTEST") != "1":
     H.HOST_NS = os.open("/proc/self/ns/net", os.O_RDONLY)
     os.setns(os.open(H.NETNS, os.O_RDONLY), os.CLONE_NEWNET)
@@ -32,6 +33,11 @@ def scenario():
             else: raise KeyError(name)
         return _cache[name]
     return get
+
+
+@pytest.fixture(scope="session")
+def events_offset():
+    return EVENTS_OFFSET
 
 
 def pytest_sessionfinish(session, exitstatus):

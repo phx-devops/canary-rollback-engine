@@ -1,5 +1,5 @@
 """Crash and reboot recovery (instruction.md: Crashes and reboots)."""
-import time
+import json, os, tempfile, time
 import pytest
 import harness as H
 from harness import DWELL
@@ -111,3 +111,23 @@ def test_abort_reboot_events(scenario):
     assert [e["type"] for e in mine].count("aborted") == 1, "the abort must be logged exactly once"
     assert H.terminal_problem(mine, "aborted") is None, H.terminal_problem(mine, "aborted")
     assert not H.rule_problems(mine), H.rule_problems(mine)[:3]
+
+
+def test_up_rewrites_stale_status_for_same_terminal_rollout(scenario):
+    terminal = scenario("abortreboot")["final_status"]
+    assert terminal["state"] == "aborted", terminal
+    stale = dict(terminal, state="shifting", weights=H.STAGE_W[terminal["stage"]],
+                 pid=terminal["pid"] or 1, abort_reason=None)
+    fd, temporary = tempfile.mkstemp(dir=os.path.dirname(H.STATUS), prefix="status-test-")
+    try:
+        with os.fdopen(fd, "w") as f: json.dump(stale, f)
+        os.replace(temporary, H.STATUS)
+        p, _ = H.ctl("up")
+        out = H.last_json(p)
+        assert p.returncode == 0, p.stderr[-300:]
+        assert out["state"] == "aborted" and out["rollout_id"] == terminal["rollout_id"], out
+        assert H.status() == out
+    finally:
+        if os.path.exists(temporary): os.unlink(temporary)
+        p, _ = H.ctl("up")
+        assert p.returncode == 0, p.stderr[-300:]

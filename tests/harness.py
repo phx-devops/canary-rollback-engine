@@ -90,11 +90,14 @@ def parse_events(lines):
             bad.append(f"line {i}: bad sample counts")
         elif t == "stage" and not (e.get("stage") in (1, 2, 3) and e.get("weights") == STAGE_W.get(e.get("stage"))):
             bad.append(f"line {i}: stage event needs stage 1-3 and that stage's weights")
-        elif t == "aborted" and not (isinstance(e.get("reason"), str) and e["reason"] and isint(e.get("green_requests"))
-                                         and isint(e.get("green_errors")) and e["green_requests"] >= 0
-                                         and 0 <= e["green_errors"] <= e["green_requests"]
-                                         and isnum(e.get("error_rate"))):
-            bad.append(f"line {i}: aborted event needs reason, green_requests, green_errors, error_rate")
+        elif t == "aborted":
+            n, errors, rate = e.get("green_requests"), e.get("green_errors"), e.get("error_rate")
+            valid_counts = isint(n) and isint(errors) and n >= 0 and 0 <= errors <= n
+            valid_rate = False
+            if valid_counts:
+                valid_rate = rate is None if n == 0 else isnum(rate)
+            if not (isinstance(e.get("reason"), str) and e["reason"] and valid_counts and valid_rate):
+                bad.append(f"line {i}: aborted event needs reason, valid counts, and a numeric rate unless empty")
         elif t == "resumed" and e.get("stage") not in (1, 2, 3):
             bad.append(f"line {i}: resumed event needs stage 1-3")
         evs.append(e)
@@ -200,15 +203,20 @@ def rule_problems(mine, error_abort=True):
             if (t == "stage" and e["stage"] > 1) or t == "promoted":
                 if not (evaluated and f / n <= THRESHOLD):
                     probs.append(f"{t} {e.get('stage', '')} decided on window {f}/{n} ({len(last)} samples)")
-            if t == "aborted" and error_abort:
-                if not (evaluated and f / n > THRESHOLD):
-                    probs.append(f"abort decided on window {f}/{n}")
-                elif (e["green_requests"], e["green_errors"]) != (n, f):
-                    probs.append(f"abort logged {e['green_errors']}/{e['green_requests']} but window was {f}/{n}")
-                elif not isnum(e.get("error_rate")):
-                    probs.append(f"abort logged a non-numeric error_rate {e.get('error_rate')!r}")
-                elif n and abs(e["error_rate"] - f / n) > 0.000001:
-                    probs.append(f"abort logged error_rate {e['error_rate']} but window was {f}/{n}")
+            if t == "aborted":
+                logged_n, logged_errors = e["green_requests"], e["green_errors"]
+                logged_rate = e["error_rate"]
+                expected_rate = logged_errors / logged_n if logged_n else None
+                if logged_rate != expected_rate and not (
+                    isnum(logged_rate) and isnum(expected_rate)
+                    and abs(logged_rate - expected_rate) <= 0.000001
+                ):
+                    probs.append(f"abort logged error_rate {logged_rate!r} but counts were {logged_errors}/{logged_n}")
+                if error_abort:
+                    if not (evaluated and f / n > THRESHOLD):
+                        probs.append(f"abort decided on window {f}/{n}")
+                    elif (logged_n, logged_errors) != (n, f):
+                        probs.append(f"abort logged {logged_errors}/{logged_n} but window was {f}/{n}")
         prev = e
     # every evaluated breach must be followed at once by the abort
     win = []
@@ -321,16 +329,21 @@ class Load:
 class Watch:
     """Poll the status file every 0.2 s: validate it and record when each stage/terminal state first appears."""
     def __init__(self, allow_missing=False):
-        self.first, self.run, self.bad, self.allow_missing = {}, True, [], allow_missing
+        self.first, self.first_monotonic = {}, {}
+        self.run, self.bad, self.allow_missing = True, [], allow_missing
+        self.last_status, self.terminal_wait_diagnostic = {}, None
         self.thread = None
     def loop(self):
         while self.run:
             s = status()
             if not s and self.allow_missing and not os.path.exists(STATUS): time.sleep(0.2); continue
+            self.last_status = s
             p = status_problem(s)
             if p and len(self.bad) < 5: self.bad.append(f"{p}: {s}")
             key = s.get("state") if s.get("state") in ("promoted", "aborted") else ("stage", s.get("stage"))
-            self.first.setdefault(key, time.time()); time.sleep(0.2)
+            self.first.setdefault(key, time.time())
+            self.first_monotonic.setdefault(key, time.monotonic())
+            time.sleep(0.2)
     def __enter__(self):
         self.thread = threading.Thread(target=self.loop, daemon=True)
         self.thread.start()
@@ -339,16 +352,26 @@ class Watch:
         self.run = False
         if self.thread: self.thread.join()
     def wait(self, key, timeout):
-        end = time.time() + timeout
-        while time.time() < end:
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
             if key in self.first: return self.first[key]
             time.sleep(0.1)
     def wait_terminal(self, timeout):
-        end = time.time() + timeout
-        while time.time() < end:
+        started = time.monotonic()
+        end = started + timeout
+        while time.monotonic() < end:
             for k in ("promoted", "aborted"):
                 if k in self.first: return k, self.first[k]
             time.sleep(0.1)
+        stage3_seen = self.first_monotonic.get(("stage", 3))
+        self.terminal_wait_diagnostic = {
+            "timeout_seconds": timeout,
+            "elapsed_seconds": round(time.monotonic() - started, 2),
+            "last_status": dict(self.last_status),
+            "stage3_observed_seconds": (
+                round(time.monotonic() - stage3_seen, 2) if stage3_seen is not None else None
+            ),
+        }
         return None, None
 
 

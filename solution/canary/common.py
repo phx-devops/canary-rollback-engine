@@ -17,6 +17,16 @@ BLUE_ADDR, GREEN_ADDR = "127.0.0.1:9001", "127.0.0.1:9002"
 STAGES = {1: (90, 10), 2: (50, 50), 3: (0, 100)}
 
 def W(b, g): return {"app-blue": b, "app-green": g}
+def error_rate(requests, errors): return errors / requests if requests else None
+
+def count_green(lines):
+    req = err = 0
+    for line in lines:
+        fields = line.split()
+        if len(fields) != 4 or fields[1] != GREEN_ADDR: continue
+        req += 1
+        if not fields[2].isdigit() or int(fields[2]) >= 500: err += 1
+    return req, err
 
 # ---------------------------------------------------------------- durable state
 IDLE = {"rollout_id": None, "state": "idle", "stage": None, "dwell": None, "stage_entered_at": None,
@@ -180,6 +190,6 @@ def reconcile_events(st):
     n, e = w["green_requests"], w["green_errors"]
     if st["state"] == "aborted" and "aborted" not in types:
         event({"type": "aborted", "rollout_id": rid, "reason": st["abort_reason"], "green_requests": n,
-               "green_errors": e, "error_rate": e / n if n else 0.0})
+               "green_errors": e, "error_rate": error_rate(n, e)})
     if st["state"] == "promoted" and "promoted" not in types:
         event({"type": "promoted", "rollout_id": rid})

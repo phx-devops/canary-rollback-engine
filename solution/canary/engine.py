@@ -7,8 +7,9 @@ summed requests, evaluated only with a full window and at least 20 requests. A r
 (--resume) starts with an empty window."""
 import argparse, collections, os, signal, sys, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from common import (RUN, ENGINE_PID, ACCESS_LOG, GREEN_ADDR, STAGES, W, load_state, save_state, apply,
-                    nginx_pid, kill_stray_nginx, start_nginx, write_conf, write_status, event, reconcile_events)
+from common import (RUN, ENGINE_PID, ACCESS_LOG, STAGES, W, load_state, save_state, apply,
+                    nginx_pid, kill_stray_nginx, start_nginx, write_conf, write_status, event, reconcile_events,
+                    error_rate, count_green)
 
 PERIOD, WINDOW_SAMPLES, THRESHOLD, MIN_REQ, WATCH = 2.0, 5, 0.05, 20, 0.25
 
@@ -41,16 +42,6 @@ class Tail:
         *done, self.buf = self.buf.split(b"\n")
         return [l.decode(errors="replace") for l in done]
 
-def count(lines):
-    """`$msec $upstream_addr $upstream_status $status`, one line per request (no retries are configured)."""
-    req = err = 0
-    for l in lines:
-        p = l.split()
-        if len(p) != 4 or p[1] != GREEN_ADDR or p[3] == "499": continue      # 499: the client gave up
-        req += 1
-        if not p[2].isdigit() or int(p[2]) >= 500: err += 1                  # 5xx, 502 refused, 504 timeout
-    return req, err
-
 tail = Tail(ACCESS_LOG)
 window = collections.deque(maxlen=WINDOW_SAMPLES)
 status = {"rollout_id": rid, "pid": os.getpid(), "state": "shifting", "abort_reason": None}
@@ -59,7 +50,7 @@ def totals(): return sum(x[0] for x in window), sum(x[1] for x in window)
 
 def win(n, e):
     """The status window: exactly the totals of the last five samples, error_rate = errors / requests."""
-    return {"seconds": 10, "green_requests": n, "green_errors": e, "error_rate": e / n if n else None}
+    return {"seconds": 10, "green_requests": n, "green_errors": e, "error_rate": error_rate(n, e)}
 
 def publish(n, e):
     """Atomically publish the current status; the corresponding sample event is logged by the caller."""
@@ -73,7 +64,7 @@ def abort(reason, n, e):
     apply(st)                                                                     # 2. nginx -> 100/0
     publish(n, e)                                                                 # 3. report
     event({"type": "aborted", "rollout_id": rid, "reason": reason, "green_requests": n, "green_errors": e,
-           "error_rate": e / n if n else 0.0})
+           "error_rate": error_rate(n, e)})
 
 # Start-up: finish any decision a crash cut off, then announce the (re)start.
 reconcile_events(st)
@@ -91,12 +82,12 @@ while True:
         save_state(st); write_conf(100, 0); kill_stray_nginx(os.getuid()); start_nginx()
         publish(n, e)
         event({"type": "aborted", "rollout_id": rid, "reason": st["abort_reason"], "green_requests": n,
-               "green_errors": e, "error_rate": e / n if n else 0.0})
+               "green_errors": e, "error_rate": error_rate(n, e)})
         break
     if time.monotonic() < nxt:
         time.sleep(min(WATCH, max(0, nxt - time.monotonic()))); continue
     nxt += PERIOD
-    req, err = count(tail.lines()); window.append((req, err))
+    req, err = count_green(tail.lines()); window.append((req, err))
     n, e = totals()
     publish(n, e)
     event({"type": "sample", "rollout_id": rid, "green_requests": req, "green_errors": err})

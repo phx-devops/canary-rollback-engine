@@ -4,7 +4,9 @@ Each bad case is a mistake a plausible engine could make; the checker must flag 
 import json, os, sys
 import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "solution", "canary"))
 import harness as H
+import common as C
 
 GOOD_SHIFTING = {"rollout_id": "r1", "state": "shifting", "stage": 2, "weights": {"app-blue": 50, "app-green": 50}, "pid": 42,
                  "window": {"seconds": 10, "green_requests": 150, "green_errors": 0, "error_rate": 0.0}, "abort_reason": None}
@@ -93,10 +95,29 @@ def test_parse_accepts_unknown_types_and_blank_lines():
     ev(1, "aborted", rollout_id="r1", reason="x", green_requests=1, green_errors=1),    # no error_rate
     ev(1, "aborted", rollout_id="r1", reason="x", green_requests=1, green_errors=2, error_rate=2),
     ev(1, "aborted", rollout_id="r1", reason="x", green_requests=1, green_errors=1, error_rate="1"),
+    ev(1, "aborted", rollout_id="r1", reason="x", green_requests=0, green_errors=0, error_rate=0.0),
+    ev(1, "aborted", rollout_id="r1", reason="x", green_requests=1, green_errors=0, error_rate=None),
 ], ids=["not-json", "no-ts", "string-ts", "no-rid", "errors-gt-requests", "weights-list", "weights-wrong",
-        "empty-reason", "no-error-rate", "errors-over-requests", "string-error-rate"])
+        "empty-reason", "no-error-rate", "errors-over-requests", "string-error-rate", "empty-window-rate",
+        "nonempty-window-null-rate"])
 def test_parse_rejects(line):
     assert H.parse_events([line])[1]
+
+
+def test_parse_accepts_null_rate_for_empty_abort_window():
+    line = ev(1, "aborted", rollout_id="r1", reason="ingress unavailable",
+              green_requests=0, green_errors=0, error_rate=None)
+    assert not H.parse_events([line])[1]
+
+
+def test_count_green_classifies_upstream_failures_even_for_client_499():
+    lines = [
+        "1.0 127.0.0.1:9002 500 499",
+        "2.0 127.0.0.1:9002 200 499",
+        "3.0 127.0.0.1:9001 502 502",
+        "4.0 127.0.0.1:9002 - 504",
+    ]
+    assert C.count_green(lines) == (3, 2)
 
 
 def test_parse_rejects_time_going_backwards():
@@ -294,3 +315,19 @@ def test_watch_context_joins_polling_thread(monkeypatch):
     with watch:
         thread = watch.thread
     assert thread is not None and not thread.is_alive()
+
+
+def test_watch_terminal_timeout_uses_monotonic_clock(monkeypatch):
+    clock = {"wall": 0.0, "monotonic": 0.0}
+    monkeypatch.setattr(H.time, "time", lambda: clock["wall"])
+    monkeypatch.setattr(H.time, "monotonic", lambda: clock["monotonic"])
+
+    def sleep(seconds):
+        clock["wall"] += seconds * 1000
+        clock["monotonic"] += seconds
+
+    monkeypatch.setattr(H.time, "sleep", sleep)
+    watch = H.Watch()
+
+    assert watch.wait_terminal(0.3) == (None, None)
+    assert watch.terminal_wait_diagnostic["elapsed_seconds"] >= 0.29
