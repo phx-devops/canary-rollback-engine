@@ -57,6 +57,8 @@ def test_all_traffic_on_green_after_promotion(scenario, name):
 def test_up_preserves_promoted_state_and_green_traffic(scenario):
     r = scenario("healthy")
     assert r["term"] == "promoted", r["final_status"]
+    assert r.get("promotion_event_omitted"), "did not create the promotion-decision recovery case"
+    assert [e["type"] for e in H.rollout_events(r["events"], r["start"]["rid"])].count("promoted") == 1
     up = r["up_after_promotion"]
     status = up["out"]
     assert up["rc"] == 0, up["stderr"]

@@ -10,10 +10,14 @@ MUTANTS = {
     # --- telemetry / decision mistakes
     "mean_of_ratios":   [("engine.py", "if evaluated and e / n > THRESHOLD:",
                           "if evaluated and sum((x[1] / x[0] if x[0] else 0) for x in window) / len(window) > THRESHOLD:")],
-    "all_5xx":          [("engine.py", 'if len(p) != 4 or p[1] != GREEN_ADDR or p[3] == "499": continue',
-                          'if len(p) != 4 or p[3] == "499": continue')],
+    "all_5xx":          [("common.py", 'if len(fields) != 4 or fields[1] != GREEN_ADDR: continue',
+                          'if len(fields) != 4: continue')],
     "empty_is_healthy": [("engine.py", "evaluated = len(window) == WINDOW_SAMPLES and n >= MIN_REQ",
                           "evaluated = True; n = n or 1")],
+    "reset_dwell_on_resume": [("engine.py", 'st = load_state()\nif st["state"] != "shifting": sys.exit(0)',
+                               'st = load_state()\nif a.resume: st["stage_entered_at"] = time.time(); save_state(st)\nif st["state"] != "shifting": sys.exit(0)')],
+    "reset_window_on_stage": [("engine.py", 'st.update(stage=st["stage"] + 1, stage_entered_at=time.time(), window=win(n, e)); save_state(st)\n        apply(st); publish(n, e)',
+                               'window.clear(); n, e = totals()\n        st.update(stage=st["stage"] + 1, stage_entered_at=time.time(), window=win(n, e)); save_state(st)\n        apply(st); publish(n, e)')],
     "drain_not_zero":   [("common.py", '    if st["state"] == "promoted": return (0, 100)',
                           '    if st["state"] == "promoted": return (0, 100)\n    if st["state"] == "aborted": return (99, 1)')],
     "no_watchdog":      [("engine.py", "    if not nginx_pid():\n        # The ingress died", "    if False:\n        # The ingress died")],
@@ -32,6 +36,9 @@ MUTANTS = {
     "state_in_run":     [("common.py", 'STATE, STATUS, EVENTS = f"{LIB}/state.json"', 'STATE, STATUS, EVENTS = f"{RUN}/state.json"'),
                          ("common.py", "    d = os.open(LIB, os.O_RDONLY)", "    d = os.open(RUN, os.O_RDONLY)")],
     "no_resumed_event": [("engine.py", 'if a.resume: event({"type": "resumed", "rollout_id": rid, "stage": st["stage"]})', "pass")],
+    "no_reconcile_events": [("engine.py", "reconcile_events(st)\npublish(0, 0)", "publish(0, 0)"),
+                            ("canaryctl", "        reconcile_events(st)                       # a decision the crash cut off still gets logged once",
+                             "        pass")],
     # --- isolation / interface mistakes
     "root_engine":      [("canaryctl", '"nsenter", f"--net={NETNS}", "--", "setpriv", f"--reuid={U.pw_uid}", f"--regid={U.pw_gid}",\n'
                           '                "--clear-groups", "--inh-caps=-all", "--bounding-set=-all", "--no-new-privs", "--"]',

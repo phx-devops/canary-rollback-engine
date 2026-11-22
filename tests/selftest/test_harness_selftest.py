@@ -147,8 +147,9 @@ def test_exact_5_percent_is_not_an_abort_breach():
 
 def test_20_request_minimum_is_evaluated_but_19_is_not():
     at_minimum = [stage(0, 1)] + [sample(2 * i, 4) for i in range(1, 6)]
-    m = mine(at_minimum)
-    assert H.rule_problems(m) == []
+    assert H.rule_problems(mine(at_minimum + [stage(10, 2)])) == []
+    exactly_19 = [stage(0, 1)] + [sample(2 * i, 3) for i in range(1, 5)] + [sample(10, 7)]
+    assert any("decided on window" in p for p in H.rule_problems(mine(exactly_19 + [stage(10, 2)])))
     below = [stage(0, 1)] + [sample(2 * i, 3) for i in range(1, 6)] + [stage(10, 2)]
     assert any("decided on window" in p for p in H.rule_problems(mine(below)))
 
@@ -168,6 +169,17 @@ def test_status_window_must_match_latest_five_samples():
     assert H.status_window_problem(status, events) is not None
 
 
+def test_status_window_keeps_samples_across_stage_and_resets_at_resume():
+    events = mine([stage(0, 1)] + [sample(2 * i, 20) for i in range(1, 6)] + [stage(10, 2)])
+    status = variant(GOOD_SHIFTING, stage=2, weights=H.STAGE_W[2],
+                     window={"seconds": 10, "green_requests": 100, "green_errors": 0, "error_rate": 0.0})
+    assert H.status_window_problem(status, events) is None
+
+    events += mine([resumed(12, 2), sample(14, 10), sample(16, 10)])
+    status["window"] = {"seconds": 10, "green_requests": 20, "green_errors": 0, "error_rate": 0.0}
+    assert H.status_window_problem(status, events) is None
+
+
 def test_status_event_snapshot_retries_transient_mismatch(monkeypatch):
     samples = [{"type": "sample", "rollout_id": "r1", "green_requests": 30, "green_errors": 0}
                for _ in range(5)]
@@ -180,6 +192,37 @@ def test_status_event_snapshot_retries_transient_mismatch(monkeypatch):
     assert status == GOOD_SHIFTING
     assert events == samples
     assert not event_bad and status_bad is None and window_bad is None
+
+
+def test_omit_decision_event_preserves_event_offsets(tmp_path, monkeypatch):
+    path = tmp_path / "events.jsonl"
+    first = ev(1, "stage", rollout_id="r1", stage=1, weights=H.STAGE_W[1]).encode() + b"\n"
+    target = ev(2, "promoted", rollout_id="r1").encode() + b"\n"
+    last = ev(3, "promoted", rollout_id="r2").encode() + b"\n"
+    path.write_bytes(first + target + last)
+    monkeypatch.setattr(H, "EVENTS", str(path))
+
+    assert H.omit_decision_event("r1", "promoted")
+    rewritten = path.read_bytes()
+    assert len(rewritten) == len(first + target + last)
+    assert rewritten[:len(first)] == first
+    assert rewritten[-len(last):] == last
+    events, bad = H.read_events(0)
+    assert not bad and [event["rollout_id"] for event in events] == ["r1", "r2"]
+
+
+def test_reconcile_restores_stage_event_at_persisted_entry_time(tmp_path, monkeypatch):
+    path = tmp_path / "events.jsonl"
+    path.write_text(ev(1, "stage", rollout_id="r1", stage=1, weights=H.STAGE_W[1]) + "\n" +
+                    ev(2, "stage", rollout_id="r1", stage=2, weights=H.STAGE_W[2]) + "\n")
+    monkeypatch.setattr(C, "EVENTS", str(path))
+
+    C.reconcile_events({"rollout_id": "r1", "stage": 3, "stage_entered_at": 12.5,
+                        "state": "shifting", "window": None})
+
+    events = [json.loads(line) for line in path.read_text().splitlines()]
+    assert events[-1]["type"] == "stage" and events[-1]["stage"] == 3
+    assert events[-1]["ts"] == 12.5
 
 
 def test_flags_ignored_breach():
@@ -268,6 +311,16 @@ def test_dwell_counts_across_restart_and_flags_reset_clock():
     assert H.dwell_problem(mine(good), 15) is None
     reset = [stage(0, 1), sample(2, 30), resumed(12, 1), stage(12, 2)]
     assert H.dwell_problem(mine(reset), 15) is not None
+
+
+def test_first_eligible_post_dwell_sample_advances_after_restart():
+    healthy = [stage(0, 1)] + [sample(2 * i, 30) for i in range(1, 5)] + [resumed(10, 1)] + \
+              [sample(t, 30) for t in (12, 14, 16, 18, 20)] + [stage(20, 2)]
+    assert H.dwell_progress_problem(mine(healthy), 15) is None
+
+    reset_clock = [stage(0, 1)] + [sample(2 * i, 30) for i in range(1, 5)] + [resumed(10, 1)] + \
+                  [sample(t, 30) for t in (12, 14, 16, 18, 20, 22, 24, 26)] + [stage(26, 2)]
+    assert H.dwell_progress_problem(mine(reset_clock), 15) is not None
 
 
 def test_recovered_decision_placed_before_resumed_is_valid():

@@ -42,6 +42,34 @@ def _finish_rollout(r, load, watch, events_offset):
     if window_bad: r["status_bad"].append(window_bad)
 
 
+def _capture_live_window(r, events_offset, label, stage, resumes, allow_promoted=False):
+    deadline = time.monotonic() + 8
+    snapshot = None
+    while time.monotonic() < deadline:
+        snapshot = H.status_event_snapshot(events_offset)
+        status, events, event_bad, status_bad, window_bad = snapshot
+        mine = H.rollout_events(events, r["start"]["rid"])
+        resumed = sum(event["type"] == "resumed" for event in mine)
+        states = ("shifting", "promoted") if allow_promoted else ("shifting",)
+        if status.get("state") in states and status.get("stage") == stage and resumed >= resumes:
+            break
+        time.sleep(0.1)
+    status, events, event_bad, status_bad, window_bad = snapshot
+    mine = H.rollout_events(events, r["start"]["rid"])
+    resumed = sum(event["type"] == "resumed" for event in mine)
+    problems = []
+    states = ("shifting", "promoted") if allow_promoted else ("shifting",)
+    if status.get("state") not in states or status.get("stage") != stage:
+        expected = "shifting or promoted" if allow_promoted else "shifting"
+        problems.append(f"expected {expected} stage {stage}, got {status}")
+    if resumed < resumes:
+        problems.append(f"expected at least {resumes} resumed events, got {resumed}")
+    if event_bad: problems.append(f"event errors: {event_bad[:2]}")
+    if status_bad: problems.append(f"status error: {status_bad}")
+    if window_bad: problems.append(f"window mismatch: {window_bad}")
+    r.setdefault("live_window_checks", []).append({"label": label, "problems": problems})
+
+
 def _bursty():
     """Inject two low-volume, high-error samples at stage 2, diluted by the preceding clean traffic."""
     burst_start = [None]
@@ -93,6 +121,8 @@ def run_promote(name, events_offset):
             r["term"], r["t_term"] = W.wait_terminal(4 * DWELL + 40)
             r["green_truth"] = H.appctl("app-green", cmd="stats")["requests"]
             if name == "healthy" and r["term"] == "promoted":
+                H.kill_engine()
+                r["promotion_event_omitted"] = H.omit_decision_event(r["start"]["rid"], "promoted")
                 r["up_after_promotion"] = _up()
                 time.sleep(2)
             time.sleep(3)
@@ -152,14 +182,23 @@ def run_chaos(events_offset):
     with H.Load(lambda t: 60) as L, H.Watch(allow_missing=True) as W:
         r["start"] = _start()
         if W.wait(("stage", 1), 10):
+            _capture_live_window(r, events_offset, "stage-1", 1, 0)
             time.sleep(5); H.kill_engine(); time.sleep(2); r["ups"].append(_up())        # mid stage 1
+            _capture_live_window(r, events_offset, "resume-stage-1", 1, 1)
         if W.wait(("stage", 2), 3 * DWELL + 30):
+            _capture_live_window(r, events_offset, "stage-2", 2, 1)
             time.sleep(4); r["t_reboot"] = time.time(); H.reboot()                         # mid stage 2
             time.sleep(2); u = _up(); r["ups"].append(u); r["t_reboot_up"] = u["t_done"]
+            _capture_live_window(r, events_offset, "resume-stage-2", 2, 2)
             time.sleep(3); r["proc"] = H.proc_snapshot()
         if W.wait(("stage", 3), 3 * DWELL + 40):
-            H.kill_engine(); time.sleep(1); r["ups"].append(_up())                          # right after a stage change
+            _capture_live_window(r, events_offset, "stage-3", 3, 2)
+            H.kill_engine()
+            r["stage3_event_omitted"] = H.omit_decision_event(r["start"]["rid"], "stage", stage=3)
+            time.sleep(1); r["ups"].append(_up())                                           # recover a durable stage decision
+            _capture_live_window(r, events_offset, "resume-stage-3", 3, 3)
             time.sleep(7); H.kill_engine(); time.sleep(3); r["ups"].append(_up())           # mid stage 3
+            _capture_live_window(r, events_offset, "resume-stage-3-again", 3, 4, allow_promoted=True)
         r["term"], r["t_term"] = W.wait_terminal(3 * DWELL + 60)
         r["green_truth"] = H.appctl("app-green", cmd="stats")["requests"]
         time.sleep(3)
@@ -176,6 +215,8 @@ def run_abort_reboot(events_offset):
             time.sleep(3); H.appctl("app-green", cmd="fault", mode="ratio", rate=0.08)
             r["term"], r["t_term"] = W.wait_terminal(30)
             if r["term"] == "aborted":
+                H.kill_engine()
+                r["abort_event_omitted"] = H.omit_decision_event(r["start"]["rid"], "aborted")
                 time.sleep(2); r["t_reboot"] = time.time(); H.reboot()
                 H.appctl("app-green", cmd="fault", mode="none")            # green looks healthy again
                 time.sleep(2); r["up"] = _up()

@@ -251,6 +251,38 @@ def dwell_problem(mine, dwell):
     return "; ".join(problems) if problems else None
 
 
+def dwell_progress_problem(mine, dwell):
+    """Require each healthy stage to advance on its first eligible post-dwell sample."""
+    stage = stage_ts = None
+    samples = []
+    for i, event in enumerate(mine):
+        if event["type"] == "resumed":
+            samples = []
+            continue
+        if event["type"] == "stage":
+            stage, stage_ts = event["stage"], event["ts"]
+            continue
+        if event["type"] != "sample" or stage is None:
+            continue
+        samples.append(event)
+        last = samples[-WINDOW:]
+        requests = sum(sample["green_requests"] for sample in last)
+        errors = sum(sample["green_errors"] for sample in last)
+        eligible = (
+            len(last) == WINDOW and requests >= MIN_REQ and errors / requests <= THRESHOLD
+            and event["ts"] >= stage_ts + dwell - 1
+        )
+        if not eligible:
+            continue
+        expected = ("stage", stage + 1) if stage < 3 else ("promoted", None)
+        following = mine[i + 1] if i + 1 < len(mine) else None
+        if not (following and following["type"] == expected[0]
+                and (expected[1] is None or following.get("stage") == expected[1])):
+            return (f"stage {stage} did not advance to {expected[1] or expected[0]} "
+                    f"on its first eligible sample at {event['ts']}")
+    return None
+
+
 # ---------------------------------------------------------------- environment access
 
 HOST_NS = None   # fd of the container's default netns, set by conftest before it joins the canary netns
@@ -285,6 +317,24 @@ def read_events(offset):
     try:
         with open(EVENTS, "rb") as f: f.seek(offset); return parse_events(f.read().decode(errors="replace").splitlines())
     except OSError as e: return [], [str(e)]
+
+
+def omit_decision_event(rollout_id, event_type, **match):
+    """Leave a durable decision's event absent to exercise recovery; preserve byte offsets."""
+    with open(EVENTS, "r+b") as f:
+        lines = f.readlines()
+        offset = 0
+        for line in lines:
+            try: event = json.loads(line)
+            except ValueError: event = None
+            if (isinstance(event, dict) and event.get("rollout_id") == rollout_id
+                    and event.get("type") == event_type
+                    and all(event.get(key) == value for key, value in match.items())):
+                replacement = b" " * (len(line) - 1) + b"\n" if line.endswith(b"\n") else b" " * len(line)
+                f.seek(offset); f.write(replacement); f.flush(); os.fsync(f.fileno())
+                return True
+            offset += len(line)
+    return True
 
 
 def fresh():

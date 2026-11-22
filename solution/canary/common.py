@@ -184,7 +184,11 @@ def reconcile_events(st):
     mine = logged_events(rid)
     have = {e["stage"] for e in mine if e.get("type") == "stage"}
     for k in range(1, (st["stage"] or 0) + 1):
-        if k not in have: event({"type": "stage", "rollout_id": rid, "stage": k, "weights": W(*STAGES[k])})
+        if k not in have:
+            recovered = {"type": "stage", "rollout_id": rid, "stage": k, "weights": W(*STAGES[k])}
+            if k == st["stage"] and st.get("stage_entered_at") is not None:
+                recovered["ts"] = st["stage_entered_at"]
+            event(recovered)
     types = {e.get("type") for e in mine}
     w = st["window"] or {"green_requests": 0, "green_errors": 0}
     n, e = w["green_requests"], w["green_errors"]

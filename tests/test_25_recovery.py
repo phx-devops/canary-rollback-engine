@@ -32,7 +32,9 @@ def test_chaos_stages_in_order_and_held(scenario):
     r = scenario("chaos"); f = r["first"]
     t = [f.get(("stage", i)) for i in (1, 2, 3)] + [r["t_term"]]
     assert all(t) and t[0] < t[1] < t[2] < t[3], t
-    assert H.dwell_problem(H.rollout_events(r["events"], r["start"]["rid"]), DWELL) is None
+    mine = H.rollout_events(r["events"], r["start"]["rid"])
+    assert H.dwell_problem(mine, DWELL) is None
+    assert H.dwell_progress_problem(mine, DWELL) is None
     for i in range(3):
         assert t[i + 1] - t[i] >= DWELL - 1, f"stage {i + 1} held {t[i + 1] - t[i]:.1f}s < dwell"
 
@@ -68,6 +70,7 @@ def test_chaos_no_client_errors_outside_reboot(scenario):
 def test_chaos_events(scenario):
     r = scenario("chaos")
     assert not r["event_bad"], r["event_bad"][:3]
+    assert r.get("stage3_event_omitted"), "did not create the stage-decision recovery case"
     mine = H.rollout_events(r["events"], r["start"]["rid"])
     resumed = [e for e in mine if e["type"] == "resumed"]
     assert len(resumed) == 4, f"{len(resumed)} resumed events for 4 restarts"
@@ -84,6 +87,12 @@ def test_chaos_decisions_follow_rule_on_own_samples(scenario):
 
 def test_chaos_status_schema(scenario):
     assert not scenario("chaos")["status_bad"], scenario("chaos")["status_bad"][:2]
+
+
+def test_chaos_live_windows_match_samples_after_transitions(scenario):
+    checks = scenario("chaos").get("live_window_checks", [])
+    assert len(checks) == 7, checks
+    assert not [check for check in checks if check["problems"]], checks
 
 
 def test_abort_survives_reboot(scenario):
@@ -107,6 +116,7 @@ def test_abort_reboot_traffic_stays_blue(scenario):
 def test_abort_reboot_events(scenario):
     r = scenario("abortreboot")
     assert not r["event_bad"], r["event_bad"][:3]
+    assert r.get("abort_event_omitted"), "did not create the abort-decision recovery case"
     mine = H.rollout_events(r["events"], r["start"]["rid"])
     assert [e["type"] for e in mine].count("aborted") == 1, "the abort must be logged exactly once"
     assert H.terminal_problem(mine, "aborted") is None, H.terminal_problem(mine, "aborted")
