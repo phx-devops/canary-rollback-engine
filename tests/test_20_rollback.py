@@ -1,10 +1,10 @@
 """Rollouts that must abort: app-green at 8 % (50/50), crash (50/50), hang (0/100 bake), ingress killed
-(50/50), and the engine killed as app-green starts failing (50/50)."""
+entirely or only its nginx master (50/50), and the engine killed as app-green starts failing (50/50)."""
 import pytest
 import harness as H
-from scenarios import ABORT_DEADLINE
+from scenarios import ABORT_DEADLINE, INGRESS_KILLS
 
-ABORT = ["green8", "crash", "hang", "proxykill", "killfault"]
+ABORT = ["green8", "crash", "hang", "proxykill", "masterkill", "killfault"]
 
 
 @pytest.mark.parametrize("name", ABORT)
@@ -26,7 +26,7 @@ def test_aborted_within_deadline(scenario, name):
 def test_traffic_back_on_blue_without_errors(scenario, name):
     r = scenario(name)
     assert r["t_term"], "no abort"
-    t0 = r["t_term"] + 1 if name != "proxykill" else max(r["t_term"] + 1, r["t_fault"] + 10)
+    t0 = r["t_term"] + 1 if name not in INGRESS_KILLS else max(r["t_term"] + 1, r["t_fault"] + 10)
     if name == "killfault": t0 = max(t0, r["up"]["t_done"] + 5)
     after = [x for x in r["rec"] if t0 <= x[0] < r["t_term"] + 28]
     assert after, "no requests recorded after the abort"
@@ -73,8 +73,15 @@ def test_events_record_stages_and_abort(scenario, name):
 @pytest.mark.parametrize("name", ABORT)
 def test_decisions_follow_rule_on_own_samples(scenario, name):
     r = scenario(name)
-    probs = H.rule_problems(H.rollout_events(r["events"], r["start"]["rid"]), error_abort=(name != "proxykill"))
+    probs = H.rule_problems(H.rollout_events(r["events"], r["start"]["rid"]), error_abort=(name not in INGRESS_KILLS))
     assert not probs, probs[:3]
+
+
+def test_masterkill_left_orphaned_workers(scenario):
+    """The case is real: killing only the master left its workers listening on :8080."""
+    r = scenario("masterkill")
+    assert len(r.get("killed", ())) == 1, f"could not identify a single nginx master: {r.get('killed')}"
+    assert r.get("orphans"), "no nginx workers were left behind by the master"
 
 
 def test_split_holds_while_green_fails(scenario):

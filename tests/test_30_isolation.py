@@ -1,9 +1,11 @@
 """Unprivileged, detached, inside the namespace (instruction.md: Running unprivileged and detached).
 Checked on every non-target process in the netns during a healthy rollout and after the proxy restart."""
+import hashlib, subprocess
 import pytest
 import harness as H
 
-WHEN = {"mid-rollout": "healthy", "after-proxy-restart": "proxykill", "after-reboot": "chaos"}
+WHEN = {"mid-rollout": "healthy", "after-proxy-restart": "proxykill", "after-master-restart": "masterkill",
+        "after-reboot": "chaos"}
 
 
 @pytest.mark.parametrize("when", WHEN)
@@ -26,6 +28,27 @@ def test_every_toolchain_process_is_unprivileged_and_detached(scenario, when):
 
 def test_no_file_capabilities_or_setuid_helpers():
     assert not H.file_privilege_problems(), H.file_privilege_problems()
+
+
+def test_ingress_binary_is_the_packaged_nginx():
+    owners = subprocess.run(["dpkg-query", "-S", H.NGINX_EXE], capture_output=True, text=True)
+    assert owners.returncode == 0, owners.stderr
+    expected = []
+    for line in owners.stdout.splitlines():
+        package, separator, path = line.rpartition(": ")
+        if not separator or path != H.NGINX_EXE: continue
+        package = package.split(":", 1)[0]
+        md5sums = f"/var/lib/dpkg/info/{package}.md5sums"
+        with open(md5sums) as f:
+            for entry in f:
+                fields = entry.split()
+                if len(fields) == 2 and fields[1] == H.NGINX_EXE.lstrip("/"):
+                    checksum = fields[0]
+                    expected.append(checksum)
+    assert expected, f"no dpkg md5sum recorded for {H.NGINX_EXE}: {owners.stdout}"
+    with open(H.NGINX_EXE, "rb") as f:
+        actual = hashlib.md5(f.read()).hexdigest()
+    assert actual in expected, f"{H.NGINX_EXE} does not match the installed package's md5sum"
 
 
 @pytest.mark.parametrize("when", ["before-reboot", "after-reboot"])

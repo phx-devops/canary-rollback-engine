@@ -1,9 +1,10 @@
-"""Rollouts that must be promoted: healthy, app-green at 3 %, app-blue at 30 %, bursty traffic, no traffic."""
+"""Rollouts that must be promoted: healthy, app-green at 3 %, app-blue at 30 %, bursty traffic, nginx workers
+killed (and replaced by nginx), no traffic."""
 import pytest
 import harness as H
 from harness import DWELL
 
-PROMOTE = ["healthy", "green3", "blue30", "bursty"]
+PROMOTE = ["healthy", "green3", "blue30", "bursty", "workerkill"]
 ALL = PROMOTE + ["notraffic"]
 SPLIT = {1: 0.10, 2: 0.50, 3: 1.00}
 
@@ -19,7 +20,10 @@ def test_start_returns_new_rollout_within_5s(scenario, name):
 @pytest.mark.parametrize("name", ALL)
 def test_rollout_promoted(scenario, name):
     r = scenario(name)
-    assert r["term"] == "promoted", f"terminal state {r['term']}; status {r['final_status']}"
+    assert r["term"] == "promoted", (
+        f"terminal state {r['term']}; status {r['final_status']}; "
+        f"terminal wait diagnostics {r.get('terminal_wait')}"
+    )
 
 
 @pytest.mark.parametrize("name", PROMOTE)
@@ -28,8 +32,16 @@ def test_stages_in_order_and_each_held_for_dwell(scenario, name):
     t = [f.get(("stage", i)) for i in (1, 2, 3)] + [r["t_term"]]
     assert all(t), f"stages seen at {t}"
     assert t[0] < t[1] < t[2] < t[3], t
+    assert H.dwell_problem(H.rollout_events(r["events"], r["start"]["rid"]), DWELL) is None
     for i in range(3):
         assert t[i + 1] - t[i] >= DWELL - 1, f"stage {i + 1} held {t[i + 1] - t[i]:.1f}s < dwell {DWELL}s"
+
+
+@pytest.mark.parametrize("name", ALL)
+def test_advances_on_first_eligible_sample_after_dwell(scenario, name):
+    r = scenario(name)
+    p = H.dwell_progress_problem(H.rollout_events(r["events"], r["start"]["rid"]), DWELL)
+    assert p is None, p
 
 
 @pytest.mark.parametrize("stage", [1, 2, 3])
@@ -53,13 +65,37 @@ def test_all_traffic_on_green_after_promotion(scenario, name):
 def test_up_preserves_promoted_state_and_green_traffic(scenario):
     r = scenario("healthy")
     assert r["term"] == "promoted", r["final_status"]
+    assert [e["type"] for e in H.rollout_events(r["events"], r["start"]["rid"])].count("promoted") == 1
     up = r["up_after_promotion"]
     status = up["out"]
     assert up["rc"] == 0, up["stderr"]
+    assert isinstance(status, dict), f"`canaryctl up` did not print JSON status: {up['stderr']}"
     assert status["state"] == "promoted" and status["rollout_id"] == r["start"]["rid"], status
     assert status["weights"] == H.GREEN
     after_up = [item for item in r["rec"] if up["t_done"] <= item[0] < up["t_done"] + 2]
     assert after_up and all(item[2] == 200 and item[3] == "app-green" for item in after_up)
+
+
+def test_live_window_matches_samples_right_after_stage_changes(scenario):
+    checks = scenario("healthy").get("live_window_checks", [])
+    assert [c["label"] for c in checks] == ["stage-2", "stage-3"], checks
+    assert not [c for c in checks if c["problems"]], checks
+
+
+def test_workerkill_replaced_workers_without_abort(scenario):
+    """A worker that nginx replaces by itself is not the ingress stopping: the rollout carries on."""
+    r = scenario("workerkill")
+    kills = r.get("worker_kills", [])
+    assert [k.get("stage") for k in kills] == [2, 3] and not [k for k in kills if "error" in k], kills
+    assert all(k["master_alive"] and k["pid"] not in k["workers_after"] and k["workers_after"] for k in kills), kills
+    assert "aborted" not in r["first"], f"aborted after an nginx worker was replaced: {r['final_status']}"
+
+
+@pytest.mark.parametrize("name", PROMOTE)
+def test_status_never_goes_backwards(scenario, name):
+    r = scenario(name)
+    p = H.regression_problem(r["history"], r["start"]["rid"])
+    assert p is None, p
 
 
 def test_healthy_rollout_has_no_client_errors(scenario):
@@ -83,6 +119,14 @@ def test_notraffic_holds_at_stage_1(scenario):
 def test_status_file_matched_schema_on_every_poll(scenario, name):
     bad = scenario(name)["status_bad"]
     assert not bad, bad[:2]
+
+
+@pytest.mark.parametrize("name", ALL)
+def test_final_status_window_matches_sample_events(scenario, name):
+    r = scenario(name)
+    rid = r["start"]["rid"]
+    p = H.status_window_problem(r["final_status"], H.rollout_events(r["events"], rid))
+    assert p is None, p
 
 
 @pytest.mark.parametrize("name", ALL)

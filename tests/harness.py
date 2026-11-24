@@ -59,8 +59,14 @@ def status_problem(s):
     if st != "shifting" and not (s["pid"] is None or isint(s["pid"])): return "pid must be an integer or null"
     w = s["window"]
     if not (isinstance(w, dict) and w.get("seconds") == 10 and isint(w.get("green_requests")) and isint(w.get("green_errors"))
-            and (w.get("error_rate") is None or isnum(w.get("error_rate")))):
+            and w["green_requests"] >= 0 and 0 <= w["green_errors"] <= w["green_requests"]
+            and (w["error_rate"] is None or isnum(w["error_rate"]))):
         return f"bad window {w!r}"
+    if w["green_requests"] == 0:
+        if w["error_rate"] is not None:
+            return "window with zero requests must have null error_rate"
+    elif not (isnum(w["error_rate"]) and abs(w["error_rate"] - w["green_errors"] / w["green_requests"]) <= 0.000001):
+        return "window error_rate must equal green_errors / green_requests"
     if st == "shifting" and (s["weights"] != STAGE_W[s["stage"]] or s["abort_reason"] is not None): return "shifting: weights must match the stage, abort_reason null"
     if st == "promoted" and (s["weights"] != GREEN or s["stage"] != 3 or s["abort_reason"] is not None): return "promoted: stage 3, weights 0/100, abort_reason null"
     if st == "aborted" and (s["weights"] != BLUE or not isinstance(s["abort_reason"], str) or not s["abort_reason"]): return "aborted: weights 100/0 and a non-empty abort_reason"
@@ -84,9 +90,14 @@ def parse_events(lines):
             bad.append(f"line {i}: bad sample counts")
         elif t == "stage" and not (e.get("stage") in (1, 2, 3) and e.get("weights") == STAGE_W.get(e.get("stage"))):
             bad.append(f"line {i}: stage event needs stage 1-3 and that stage's weights")
-        elif t == "aborted" and not (isinstance(e.get("reason"), str) and e["reason"] and isint(e.get("green_requests"))
-                                     and isint(e.get("green_errors")) and "error_rate" in e):
-            bad.append(f"line {i}: aborted event needs reason, green_requests, green_errors, error_rate")
+        elif t == "aborted":
+            n, errors, rate = e.get("green_requests"), e.get("green_errors"), e.get("error_rate")
+            valid_counts = isint(n) and isint(errors) and n >= 0 and 0 <= errors <= n
+            valid_rate = False
+            if valid_counts:
+                valid_rate = rate is None if n == 0 else isnum(rate)
+            if not (isinstance(e.get("reason"), str) and e["reason"] and valid_counts and valid_rate):
+                bad.append(f"line {i}: aborted event needs reason, valid counts, and a numeric rate unless empty")
         elif t == "resumed" and e.get("stage") not in (1, 2, 3):
             bad.append(f"line {i}: resumed event needs stage 1-3")
         evs.append(e)
@@ -96,6 +107,50 @@ def parse_events(lines):
 
 
 def rollout_events(evs, rid): return [e for e in evs if e.get("rollout_id") == rid]
+
+
+def status_window_problem(status, events):
+    """Compare a status window with the most recent five sample events in the current rollout segment."""
+    if not isinstance(status, dict) or status.get("state") == "idle":
+        return None
+    rid = status.get("rollout_id")
+    if not isinstance(rid, str) or not rid:
+        return "status lacks rollout_id for window comparison"
+    segment = []
+    for event in rollout_events(events, rid):
+        if event["type"] == "resumed":
+            segment = []
+        elif event["type"] == "sample":
+            segment.append(event)
+    last = segment[-WINDOW:]
+    n = sum(e["green_requests"] for e in last)
+    f = sum(e["green_errors"] for e in last)
+    expected = {
+        "seconds": 10,
+        "green_requests": n,
+        "green_errors": f,
+        "error_rate": f / n if n else None,
+    }
+    actual = status.get("window")
+    if actual != expected:
+        return f"status window {actual!r} does not match event log window {expected!r}"
+    return None
+
+
+def status_event_snapshot(offset, attempts=5):
+    """Read status and events until their latest rollout window agrees or retries are exhausted."""
+    snapshot = None
+    for attempt in range(attempts):
+        events, event_bad = read_events(offset)
+        current = status()
+        status_bad = status_problem(current)
+        window_bad = status_window_problem(current, events) if not event_bad and not status_bad else None
+        snapshot = current, events, event_bad, status_bad, window_bad
+        if not event_bad and not status_bad and not window_bad:
+            break
+        if attempt + 1 < attempts:
+            time.sleep(0.05)
+    return snapshot
 
 
 def segments(mine):
@@ -148,11 +203,20 @@ def rule_problems(mine, error_abort=True):
             if (t == "stage" and e["stage"] > 1) or t == "promoted":
                 if not (evaluated and f / n <= THRESHOLD):
                     probs.append(f"{t} {e.get('stage', '')} decided on window {f}/{n} ({len(last)} samples)")
-            if t == "aborted" and error_abort:
-                if not (evaluated and f / n > THRESHOLD):
-                    probs.append(f"abort decided on window {f}/{n}")
-                elif (e["green_requests"], e["green_errors"]) != (n, f):
-                    probs.append(f"abort logged {e['green_errors']}/{e['green_requests']} but window was {f}/{n}")
+            if t == "aborted":
+                logged_n, logged_errors = e["green_requests"], e["green_errors"]
+                logged_rate = e["error_rate"]
+                expected_rate = logged_errors / logged_n if logged_n else None
+                if logged_rate != expected_rate and not (
+                    isnum(logged_rate) and isnum(expected_rate)
+                    and abs(logged_rate - expected_rate) <= 0.000001
+                ):
+                    probs.append(f"abort logged error_rate {logged_rate!r} but counts were {logged_errors}/{logged_n}")
+                if error_abort:
+                    if not (evaluated and f / n > THRESHOLD):
+                        probs.append(f"abort decided on window {f}/{n}")
+                    elif (logged_n, logged_errors) != (n, f):
+                        probs.append(f"abort logged {logged_errors}/{logged_n} but window was {f}/{n}")
         prev = e
     # every evaluated breach must be followed at once by the abort
     win = []
@@ -166,6 +230,81 @@ def rule_problems(mine, error_abort=True):
             if not (nxt and nxt["type"] == "aborted"):
                 probs.append(f"breach {f}/{n} at event {i} was not acted on")
     return probs
+
+
+def _entered_at(event, entered):
+    """When a stage was entered: its event's ts, or earlier if the verifier saw the stage sooner (a decision
+    the engine was killed inside may be logged during recovery, stamped later than when it was made)."""
+    seen = (entered or {}).get(event["stage"])
+    return min(event["ts"], seen) if isnum(seen) else event["ts"]
+
+
+def dwell_problem(mine, dwell, entered=None):
+    """Check that stage and promotion events preserve the original stage dwell time."""
+    stages = [(_entered_at(e, entered), e["stage"]) for e in mine if e["type"] == "stage"]
+    terminal = [e for e in mine if e["type"] in ("promoted", "aborted")]
+    if not stages:
+        return "no stage 1 event"
+    problems = []
+    for i, (start_ts, start_stage) in enumerate(stages):
+        if i + 1 < len(stages):
+            end_ts = stages[i + 1][0]
+        elif terminal and terminal[0]["type"] == "promoted":
+            end_ts = terminal[0]["ts"]
+        else:
+            continue
+        if end_ts - start_ts < dwell - 1:
+            problems.append(f"stage {start_stage} held {end_ts - start_ts:.1f}s < dwell {dwell}s")
+    return "; ".join(problems) if problems else None
+
+
+def dwell_progress_problem(mine, dwell, entered=None):
+    """Require each healthy stage to advance on its first eligible sample once the stage has been held
+    for the dwell time (one second of slack: the stage event is logged just after the stage is entered)."""
+    stage = stage_ts = None
+    samples = []
+    for i, event in enumerate(mine):
+        if event["type"] == "resumed":
+            samples = []
+            continue
+        if event["type"] == "stage":
+            stage, stage_ts = event["stage"], _entered_at(event, entered)
+            continue
+        if event["type"] != "sample" or stage is None:
+            continue
+        samples.append(event)
+        last = samples[-WINDOW:]
+        requests = sum(sample["green_requests"] for sample in last)
+        errors = sum(sample["green_errors"] for sample in last)
+        eligible = (
+            len(last) == WINDOW and requests >= MIN_REQ and errors / requests <= THRESHOLD
+            and event["ts"] >= stage_ts + dwell + 1
+        )
+        if not eligible:
+            continue
+        expected = ("stage", stage + 1) if stage < 3 else ("promoted", None)
+        following = mine[i + 1] if i + 1 < len(mine) else None
+        if not (following and following["type"] == expected[0]
+                and (expected[1] is None or following.get("stage") == expected[1])):
+            return (f"stage {stage} did not advance to {expected[1] or expected[0]} "
+                    f"on its first eligible sample at {event['ts']}")
+    return None
+
+
+def regression_problem(history, rid):
+    """`history` is the Watch's list of (t, rollout_id, state, stage) status changes. A rollout's status may
+    only move forward: stage 1 -> 2 -> 3 while shifting, then one terminal state that never changes."""
+    prev = None
+    for t, r, state, stage in history:
+        if r != rid or state not in ("shifting", "promoted", "aborted"): continue
+        if prev:
+            p_state, p_stage = prev
+            if p_state in ("promoted", "aborted") and (state, stage) != prev:
+                return f"status went from {p_state} back to {state} stage {stage}"
+            if p_state == state == "shifting" and isint(stage) and isint(p_stage) and stage < p_stage:
+                return f"status went from stage {p_stage} back to stage {stage}"
+        prev = (state, stage)
+    return None
 
 
 # ---------------------------------------------------------------- environment access
@@ -216,7 +355,9 @@ def green_share(recs):
 
 class Load:
     """Open-loop load generator: a new connection per request; records (sent, done, status, X-App)."""
-    def __init__(self, rps): self.rps, self.rec, self.run = rps, [], True; self.pool = ThreadPoolExecutor(800)
+    def __init__(self, rps):
+        self.rps, self.rec, self.run = rps, [], True
+        self.pool, self.thread = ThreadPoolExecutor(800), None
     def one(self):
         t0, st, app = time.time(), -1, None
         try:
@@ -230,35 +371,65 @@ class Load:
             r = self.rps(time.time())
             if r <= 0: time.sleep(0.05); nxt = time.time(); continue
             nxt += 1.0 / r; self.pool.submit(self.one); time.sleep(max(0, nxt - time.time()))
-    def __enter__(self): threading.Thread(target=self.loop, daemon=True).start(); return self
-    def __exit__(self, *a): self.run = False; self.pool.shutdown(wait=True)
+    def __enter__(self):
+        self.thread = threading.Thread(target=self.loop, daemon=True)
+        self.thread.start()
+        return self
+    def __exit__(self, *a):
+        self.run = False
+        if self.thread: self.thread.join()
+        self.pool.shutdown(wait=True)
     def window(self, t0, t1): return [r for r in self.rec if t0 <= r[0] < t1]
 
 
 class Watch:
     """Poll the status file every 0.2 s: validate it and record when each stage/terminal state first appears."""
-    def __init__(self, allow_missing=False): self.first, self.run, self.bad, self.allow_missing = {}, True, [], allow_missing
+    def __init__(self, allow_missing=False):
+        self.first, self.first_monotonic, self.history = {}, {}, []
+        self.run, self.bad, self.allow_missing = True, [], allow_missing
+        self.last_status, self.terminal_wait_diagnostic = {}, None
+        self.thread = None
     def loop(self):
         while self.run:
             s = status()
             if not s and self.allow_missing and not os.path.exists(STATUS): time.sleep(0.2); continue
+            self.last_status = s
             p = status_problem(s)
             if p and len(self.bad) < 5: self.bad.append(f"{p}: {s}")
+            change = (s.get("rollout_id"), s.get("state"), s.get("stage"))
+            if not self.history or self.history[-1][1:] != change: self.history.append((time.time(), *change))
             key = s.get("state") if s.get("state") in ("promoted", "aborted") else ("stage", s.get("stage"))
-            self.first.setdefault(key, time.time()); time.sleep(0.2)
-    def __enter__(self): threading.Thread(target=self.loop, daemon=True).start(); return self
-    def __exit__(self, *a): self.run = False
+            self.first.setdefault(key, time.time())
+            self.first_monotonic.setdefault(key, time.monotonic())
+            time.sleep(0.2)
+    def __enter__(self):
+        self.thread = threading.Thread(target=self.loop, daemon=True)
+        self.thread.start()
+        return self
+    def __exit__(self, *a):
+        self.run = False
+        if self.thread: self.thread.join()
     def wait(self, key, timeout):
-        end = time.time() + timeout
-        while time.time() < end:
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
             if key in self.first: return self.first[key]
             time.sleep(0.1)
     def wait_terminal(self, timeout):
-        end = time.time() + timeout
-        while time.time() < end:
+        started = time.monotonic()
+        end = started + timeout
+        while time.monotonic() < end:
             for k in ("promoted", "aborted"):
                 if k in self.first: return k, self.first[k]
             time.sleep(0.1)
+        stage3_seen = self.first_monotonic.get(("stage", 3))
+        self.terminal_wait_diagnostic = {
+            "timeout_seconds": timeout,
+            "elapsed_seconds": round(time.monotonic() - started, 2),
+            "last_status": dict(self.last_status),
+            "stage3_observed_seconds": (
+                round(time.monotonic() - stage3_seen, 2) if stage3_seen is not None else None
+            ),
+        }
         return None, None
 
 
@@ -309,8 +480,9 @@ def proc_snapshot():
 
 
 def file_privilege_problems():
-    fc = subprocess.run("getcap -r /opt/canary /usr/sbin /usr/bin /usr/local/bin /usr/local/sbin 2>/dev/null",
-                        shell=True, capture_output=True, text=True).stdout.strip()
+    # every regular file outside the kernel's pseudo-filesystems ("grant no file capabilities anywhere")
+    fc = subprocess.run("find / \\( -path /proc -o -path /sys -o -path /dev \\) -prune -o -type f -print0 2>/dev/null"
+                        " | xargs -0 -r getcap 2>/dev/null", shell=True, capture_output=True, text=True).stdout.strip()
     su = subprocess.run("find /opt/canary -perm /6000 -type f 2>/dev/null", shell=True, capture_output=True, text=True).stdout.strip()
     return [x for x in (fc, su) if x]
 
@@ -360,21 +532,76 @@ def reboot():
     """Simulate a node reboot: kill every process running as canary, lose /run and /tmp beyond what
     was there when the container started. /var/lib, /var/log and /opt survive."""
     import shutil
+    import stat
     uid = pwd.getpwnam("canary").pw_uid
     for _ in range(3):
         subprocess.run(["pkill", "-9", "-u", str(uid)], capture_output=True)
         time.sleep(0.3)
+    container_start = os.stat("/proc/1").st_ctime
     try:
-        with open(BASELINE) as f: keep = set(f.read().split())
-    except OSError: keep = {"/run/netns", "/run/apps"}
+        baseline_stat = os.stat(BASELINE)
+        baseline_changed = baseline_stat.st_ctime - container_start
+        if baseline_changed > 60:
+            keep = {"/run/netns", "/run/apps"}
+        else:
+            with open(BASELINE) as f:
+                keep = set(f.read().split())
+            keep.intersection_update({"/run/netns", "/run/apps"})
+    except OSError:
+        keep = {"/run/netns", "/run/apps"}
+    # Anything in the kept directories that is newer than the targets' own admin sockets (created by the
+    # entrypoint before the agent ran) was planted later and is lost. /proc/1's ctime is not a reliable
+    # container start time: procfs sets it when the inode is first looked up, which can precede the
+    # sockets (and then the reboot would delete the targets' sockets) or come much later.
+    try:
+        trust = max(os.stat(f"/run/apps/{app}.sock").st_ctime for app in ("app-blue", "app-green")) + 1
+    except OSError:
+        trust = container_start
+    if not keep:
+        keep = {"/run/netns", "/run/apps"}
+
     for top in ("/run", "/tmp"):
         for name in os.listdir(top):
             path = f"{top}/{name}"
-            if path in keep: continue
+            if path in keep:
+                continue
             try:
                 if os.path.isdir(path) and not os.path.islink(path): shutil.rmtree(path)
                 else: os.unlink(path)
             except OSError: pass
+    for path in keep:
+        if not os.path.isdir(path) or os.path.islink(path):
+            continue
+        for root, dirs, files in os.walk(path, topdown=False):
+            for name in files:
+                entry = os.path.join(root, name)
+                try:
+                    if os.stat(entry).st_ctime > trust:
+                        os.unlink(entry)
+                except OSError:
+                    pass
+            for name in dirs:
+                entry = os.path.join(root, name)
+                try:
+                    if os.stat(entry).st_ctime > trust:
+                        shutil.rmtree(entry)
+                except OSError:
+                    pass
+        for root, dirs, _ in os.walk(path, topdown=False):
+            try:
+                if hasattr(os, "listxattr"):
+                    for attr in os.listxattr(root):
+                        if attr.startswith("trusted.") or attr.startswith("user."):
+                            os.removexattr(root, attr)
+            except (OSError, AttributeError):
+                pass
+    for name in os.listdir("/dev/shm"):
+        path = os.path.join("/dev/shm", name)
+        try:
+            if os.path.isdir(path) and not os.path.islink(path): shutil.rmtree(path)
+            else: os.unlink(path)
+        except OSError:
+            pass
 
 
 def kill_engine():
@@ -383,3 +610,98 @@ def kill_engine():
         try: os.kill(pid, 9)
         except OSError: pass
     return pid
+
+
+# ---------------------------------------------------------------- nginx processes, kills inside a decision
+
+def _ppid(pid):
+    try:
+        with open(f"/proc/{pid}/stat") as f: return int(f.read().rsplit(")", 1)[1].split()[1])
+    except (OSError, ValueError, IndexError): return None
+
+
+def nginx_master():
+    """The nginx master serving :8080: the listener whose parent is not itself a listener."""
+    pids = listener_pids()
+    masters = [p for p in pids if _ppid(p) not in pids]
+    return masters[0] if len(masters) == 1 else None
+
+
+def nginx_workers(master):
+    """Children of the nginx master (its workers), or None if the master is gone."""
+    if not process_alive(master): return None
+    try:
+        with open(f"/proc/{master}/task/{master}/children") as f: return frozenset(int(x) for x in f.read().split())
+    except OSError:                                          # kernel without /proc/<pid>/task/<tid>/children
+        return frozenset(int(p) for p in os.listdir("/proc") if p.isdigit() and _ppid(int(p)) == master)
+
+
+class _EventTail:
+    """New complete lines appended to the event log since construction."""
+    def __init__(self):
+        try: self.offset = os.path.getsize(EVENTS)
+        except OSError: self.offset = 0
+        self.buf = b""
+    def new(self):
+        try:
+            if os.path.getsize(EVENTS) <= self.offset: return []
+            with open(EVENTS, "rb") as f: f.seek(self.offset); data = f.read()
+        except OSError: return []
+        self.offset += len(data); self.buf += data
+        *lines, self.buf = self.buf.split(b"\n")
+        out = []
+        for line in lines:
+            try: out.append(json.loads(line))
+            except ValueError: pass
+        return out
+
+
+def kill_at_decision(channel, timeout, action=None):
+    """Wait for the running rollout's next decision (stage change, abort or promotion) to become visible
+    through one channel, and SIGKILL the engine (or run `action`) the moment it does:
+      nginx  - the nginx master's set of workers changes (a reload: the decision reached the ingress)
+      event  - a decision event for the rollout is appended to the event log
+      status - status.json shows a new state or stage (the decision was reported)
+    Whatever the engine had not yet done at that moment, it must finish on recovery: the instruction's
+    crash model is SIGKILL at any moment, and this is just a well-chosen moment. Returns what happened;
+    `fired` is False if the decision never became visible."""
+    st = status(); rid, pid = st.get("rollout_id"), st.get("pid")
+    base_key = (st.get("state"), st.get("stage"))
+    act = action or (lambda: os.kill(pid, 9) if isint(pid) else None)
+    out = {"channel": channel, "fired": False, "pid": pid, "before": base_key}
+    since = _EventTail()
+    if channel == "nginx":
+        master = nginx_master(); base = nginx_workers(master) if master else None
+        if base is None: out["error"] = "no single nginx master found"; return out
+        def probe(): return nginx_workers(master) != base
+    elif channel == "event":
+        tail, stage = _EventTail(), st.get("stage") or 0
+        def probe():
+            return any(e.get("rollout_id") == rid and (e.get("type") in ("promoted", "aborted")
+                       or (e.get("type") == "stage" and isint(e.get("stage")) and e["stage"] > stage)) for e in tail.new())
+    elif channel == "status":
+        last = [None]
+        def probe():
+            try: s = os.stat(STATUS); key = (s.st_ino, s.st_mtime_ns)
+            except OSError: return False
+            if key == last[0]: return False
+            last[0] = key; cur = status()
+            return bool(cur) and cur.get("rollout_id") == rid and (cur.get("state"), cur.get("stage")) != base_key
+    else:
+        raise ValueError(channel)
+    import sys
+    old = sys.getswitchinterval(); sys.setswitchinterval(0.0002)     # don't let the load threads delay the kill
+    try:
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            if probe():
+                out["t"] = time.time(); act(); out["fired"] = True; break
+            time.sleep(0.0005)
+    finally:
+        sys.setswitchinterval(old)
+    if out["fired"]:
+        # diagnostics only: which parts of the decision the engine had completed when it died
+        s = status(); out["status_at_kill"] = (s.get("state"), s.get("stage"))
+        out["logged_at_kill"] = [(e.get("type"), e.get("stage")) for e in since.new()
+                                 if e.get("rollout_id") == rid and e.get("type") in ("stage", "aborted", "promoted")]
+    return out

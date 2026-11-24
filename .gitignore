@@ -1,2 +1,7 @@
 **.zip
 **.DS_Store
+jobs/**
+trials/**
+tests/**
+dist/**
+**__pycache__**
