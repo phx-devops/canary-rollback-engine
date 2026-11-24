@@ -37,7 +37,9 @@ holding a connection to `127.0.0.1:9001` or `127.0.0.1:9002`, must be nginx.
 - Changing the split must not fail or drop client requests.
 
 If the ingress stops running during a rollout while the engine is running, the engine must have
-it serving 100 % `app-blue` again within 10 seconds and abort the rollout.
+it serving 100 % `app-blue` again within 10 seconds and abort the rollout. The ingress has stopped
+running when its nginx master process has exited. A worker process that nginx replaces by itself
+is not the ingress stopping.
 
 ## Rollout
 
@@ -117,13 +119,14 @@ last line of stdout.
 - `canaryctl up`: make sure the ingress and, if a rollout is in progress, the engine are running,
   recovering from a crash or reboot as described above. If no rollout is in progress, serve the
   split of the last rollout's final state (100 % `app-blue` when there has been none). Running it
-  again must be harmless.
+  again must be harmless, including while an earlier `canaryctl up` is still running.
 - `canaryctl start [--dwell SECONDS]`: start a new rollout with a new `rollout_id` (default dwell
   30 s). Values below 10 must be rejected with a non-zero exit. Any rollout in progress is
   replaced, and its engine process must have exited before this command returns. Return within 5
   seconds, printing the new rollout's status (`state` = `shifting`), while the rollout continues
   in the background.
-- `canaryctl status`: print the current status.
+- `canaryctl status`: print the current status. If a rollout is in progress but its engine is not
+  running, first recover it as `canaryctl up` does.
 - `canaryctl reset`: stop any rollout in progress, serve 100 % `app-blue`, and set the status to
   `idle`. The old engine process must have exited before `reset` returns.
 
@@ -184,24 +187,28 @@ status file every 0.2 s. The **abort time** is the first moment it shows `aborte
 - A healthy rollout is promoted through all three stages in order. The live split is checked at
   every stage, and no client request fails.
 - Rollouts with `app-green` failing 3 % of its requests, with `app-blue` failing 30 % of its
-  requests, or with uneven bursts of traffic must all be promoted. The live split is checked at
-  every stage.
+  requests, with uneven bursts of traffic, or with an nginx worker process killed at 50/50 and
+  again at 0/100 must all be promoted. The live split is checked at every stage.
 - With no traffic, the rollout must not advance. Once traffic arrives, it proceeds.
 - Each of these faults must cause an abort within the given time of the fault starting:
   - `app-green` failing 8 % of its requests at 50/50: 18 s.
   - `app-green` crashing at 50/50: 8 s.
   - `app-green` hanging (accepting connections but never answering) during the final 0/100
     stage: 20 s.
-  - The ingress being killed at 50/50 while the engine runs: 10 s, after which it serves 100 %
-    `app-blue`.
+  - The ingress being killed at 50/50 while the engine runs, either all of its processes or only
+    its nginx master: 10 s, after which it serves 100 % `app-blue`.
   - `app-green` starting to fail 8 % of its requests at 50/50 at the moment the engine is
     killed, with `canaryctl up` run 2 s later: 25 s.
 - During a healthy rollout, the engine is killed several times and the node is rebooted once,
-  each followed by `canaryctl up`. The rollout must still be promoted under the same
+  each followed by `canaryctl up`. Some of these kills land while the engine is making a stage
+  change or promotion decision, the moment the decision first shows in the ingress, the event
+  log or the status file. The rollout must still be promoted under the same
   `rollout_id`, with the live split checked at every stage. No client request may fail, except
   between a reboot and 5 s after the following `canaryctl up` returns.
-- A rollout is aborted, then the node is rebooted. After `canaryctl up` it is still aborted, with
-  all traffic on `app-blue`.
+- The node is rebooted the moment an abort reaches the ingress. After `canaryctl up` the rollout
+  is still aborted, with all traffic on `app-blue`.
+- `canaryctl status` is run right after the engine is killed. Several `canaryctl up` commands are
+  run at once, both right after the engine is killed and while it is running.
 - After an abort, requests sent from 1 s after the abort time are all served by `app-blue`
   without error. `app-green`'s own counter does not increase from 2 s after the abort time,
   including after `app-green` recovers. Requests already in flight at the abort may finish

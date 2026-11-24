@@ -4,7 +4,7 @@
 Run as root from the default network namespace (the node agent's view). Every long-running process
 it starts (nginx and the engine) enters the canary netns while still privileged, then drops to
 canary with no groups and no capabilities; nginx daemonises itself, the engine gets `setsid -f`."""
-import argparse, json, os, pwd, signal, subprocess, sys, time, uuid
+import argparse, fcntl, json, os, pwd, signal, subprocess, sys, time, uuid
 HERE = os.path.dirname(os.path.realpath(__file__)); sys.path.insert(0, HERE)
 from common import (RUN, LOGDIR, LIB, STATUS, EVENTS, ACCESS_LOG, ERROR_LOG, ENGINE_PID, IDLE, load_state,
                     save_state, desired_weights, write_conf, nginx_pid, kill_stray_nginx, start_nginx, apply,
@@ -92,6 +92,15 @@ def stop_engine():
     if same_engine():
         sys.exit(f"canaryctl: engine process {pid} did not stop")
 
+def ctl_lock():
+    """Serialise canaryctl invocations: the node agent may run `up` again before an earlier one returns, and
+    two of them must not both find the engine dead and both start one. Held until this process exits; the
+    fd is not inherited by the engine or nginx."""
+    os.makedirs(LIB, exist_ok=True)
+    fd = os.open(f"{LIB}/ctl.lock", os.O_RDONLY | os.O_CREAT, 0o644)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    return fd
+
 def read_status():
     try:
         with open(STATUS) as f: return json.load(f)
@@ -116,15 +125,16 @@ s = sub.add_parser("start"); s.add_argument("--dwell", type=float, default=30)
 a = ap.parse_args()
 
 if a.cmd == "up":
-    up()
+    ctl_lock(); up()
 elif a.cmd == "status":
-    pass
+    if load_state()["state"] == "shifting" and not engine_pid():
+        ctl_lock(); up()                               # a shifting status always names a live engine
 elif a.cmd == "reset":
-    prepare(); stop_engine(); st = new_state(); save_state(st); own(f"{LIB}/state.json")
+    ctl_lock(); prepare(); stop_engine(); st = new_state(); save_state(st); own(f"{LIB}/state.json")
     ensure_nginx(st); write_status(status_from_state(st)); own(STATUS); event({"type": "reset"})
 elif a.cmd == "start":
     if a.dwell < 10: sys.exit("canaryctl: --dwell must be >= 10 seconds (one full evaluation window)")
-    prepare(); stop_engine()
+    ctl_lock(); prepare(); stop_engine()
     st = new_state(rollout_id=uuid.uuid4().hex[:12], state="shifting", stage=1, dwell=a.dwell, stage_entered_at=time.time())
     save_state(st); own(f"{LIB}/state.json")      # the engine logs the stage 1 event (or recovery does)
     ensure_nginx(st); launch_engine(resume=False)

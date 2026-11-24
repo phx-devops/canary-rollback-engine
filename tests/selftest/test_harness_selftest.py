@@ -194,23 +194,6 @@ def test_status_event_snapshot_retries_transient_mismatch(monkeypatch):
     assert not event_bad and status_bad is None and window_bad is None
 
 
-def test_omit_decision_event_preserves_event_offsets(tmp_path, monkeypatch):
-    path = tmp_path / "events.jsonl"
-    first = ev(1, "stage", rollout_id="r1", stage=1, weights=H.STAGE_W[1]).encode() + b"\n"
-    target = ev(2, "promoted", rollout_id="r1").encode() + b"\n"
-    last = ev(3, "promoted", rollout_id="r2").encode() + b"\n"
-    path.write_bytes(first + target + last)
-    monkeypatch.setattr(H, "EVENTS", str(path))
-
-    assert H.omit_decision_event("r1", "promoted")
-    rewritten = path.read_bytes()
-    assert len(rewritten) == len(first + target + last)
-    assert rewritten[:len(first)] == first
-    assert rewritten[-len(last):] == last
-    events, bad = H.read_events(0)
-    assert not bad and [event["rollout_id"] for event in events] == ["r1", "r2"]
-
-
 def test_reconcile_restores_stage_event_at_persisted_entry_time(tmp_path, monkeypatch):
     path = tmp_path / "events.jsonl"
     path.write_text(ev(1, "stage", rollout_id="r1", stage=1, weights=H.STAGE_W[1]) + "\n" +
@@ -384,3 +367,40 @@ def test_watch_terminal_timeout_uses_monotonic_clock(monkeypatch):
 
     assert watch.wait_terminal(0.3) == (None, None)
     assert watch.terminal_wait_diagnostic["elapsed_seconds"] >= 0.29
+
+
+# ---------------------------------------------------------------- round 8: decision kills, dwell anchoring
+def test_dwell_progress_does_not_demand_an_advance_before_the_dwell_has_passed():
+    """A sample 14-15 s into a 15 s dwell is not yet eligible (the instruction forbids advancing then)."""
+    early = [stage(0, 1)] + [sample(2 * i, 30) for i in range(1, 8)] + [stage(16, 2)]     # samples at 2..14, advance at 16
+    assert H.dwell_progress_problem(mine(early), 15) is None
+    late = [stage(0, 1)] + [sample(2 * i, 30) for i in range(1, 10)] + [stage(18, 2)]     # 16 was eligible, waited for 18
+    assert H.dwell_progress_problem(mine(late), 15) is not None
+
+
+def test_recovered_stage_event_stamped_late_is_judged_by_when_the_stage_was_entered():
+    """The engine was killed inside the 1->2 decision at t=16 (the verifier saw nginx reload then) and logged
+    it on recovery at t=19. Advancing at t=31 holds stage 2 for 15 s, though only 12 s after the logged ts."""
+    head = [stage(0, 1)] + [sample(2 * i, 30) for i in range(1, 9)] + [stage(19, 2), resumed(19, 2)] + \
+           [sample(t, 30) for t in (21, 23, 25, 27, 29)]
+    seen = {2: 16.0}
+    ok = head + [sample(31, 30), stage(31, 3)]
+    assert H.dwell_problem(mine(ok), 15) is not None                     # the logged ts alone would fail it
+    assert H.dwell_problem(mine(ok), 15, entered=seen) is None
+    assert H.dwell_progress_problem(mine(ok), 15, entered=seen) is None
+    short = head + [stage(29, 3)]                                        # 13 s: too short either way
+    assert H.dwell_problem(mine(short), 15, entered=seen) is not None
+    late = head + [sample(31, 30), sample(33, 30), sample(35, 30), stage(35, 3)]   # 33 was eligible
+    assert H.dwell_progress_problem(mine(late), 15, entered=seen) is not None
+
+
+def test_regression_problem():
+    rid = "r1"
+    fwd = [(0, None, "idle", None), (1, rid, "shifting", 1), (2, rid, "shifting", 2), (3, rid, "shifting", 3),
+           (4, rid, "promoted", 3), (5, None, "idle", None)]
+    assert H.regression_problem(fwd, rid) is None
+    assert H.regression_problem([(1, rid, "shifting", 2), (2, rid, "shifting", 1)], rid)
+    assert H.regression_problem([(1, rid, "promoted", 3), (2, rid, "shifting", 3)], rid)
+    assert H.regression_problem([(1, rid, "aborted", 2), (2, rid, "shifting", 2)], rid)
+    assert H.regression_problem([(1, rid, "promoted", 3), (2, rid, "aborted", 3)], rid)
+    assert H.regression_problem([(1, "other", "shifting", 3), (2, rid, "shifting", 1)], rid) is None

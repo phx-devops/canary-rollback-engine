@@ -232,9 +232,16 @@ def rule_problems(mine, error_abort=True):
     return probs
 
 
-def dwell_problem(mine, dwell):
+def _entered_at(event, entered):
+    """When a stage was entered: its event's ts, or earlier if the verifier saw the stage sooner (a decision
+    the engine was killed inside may be logged during recovery, stamped later than when it was made)."""
+    seen = (entered or {}).get(event["stage"])
+    return min(event["ts"], seen) if isnum(seen) else event["ts"]
+
+
+def dwell_problem(mine, dwell, entered=None):
     """Check that stage and promotion events preserve the original stage dwell time."""
-    stages = [(e["ts"], e["stage"]) for e in mine if e["type"] == "stage"]
+    stages = [(_entered_at(e, entered), e["stage"]) for e in mine if e["type"] == "stage"]
     terminal = [e for e in mine if e["type"] in ("promoted", "aborted")]
     if not stages:
         return "no stage 1 event"
@@ -251,8 +258,9 @@ def dwell_problem(mine, dwell):
     return "; ".join(problems) if problems else None
 
 
-def dwell_progress_problem(mine, dwell):
-    """Require each healthy stage to advance on its first eligible post-dwell sample."""
+def dwell_progress_problem(mine, dwell, entered=None):
+    """Require each healthy stage to advance on its first eligible sample once the stage has been held
+    for the dwell time (one second of slack: the stage event is logged just after the stage is entered)."""
     stage = stage_ts = None
     samples = []
     for i, event in enumerate(mine):
@@ -260,7 +268,7 @@ def dwell_progress_problem(mine, dwell):
             samples = []
             continue
         if event["type"] == "stage":
-            stage, stage_ts = event["stage"], event["ts"]
+            stage, stage_ts = event["stage"], _entered_at(event, entered)
             continue
         if event["type"] != "sample" or stage is None:
             continue
@@ -270,7 +278,7 @@ def dwell_progress_problem(mine, dwell):
         errors = sum(sample["green_errors"] for sample in last)
         eligible = (
             len(last) == WINDOW and requests >= MIN_REQ and errors / requests <= THRESHOLD
-            and event["ts"] >= stage_ts + dwell - 1
+            and event["ts"] >= stage_ts + dwell + 1
         )
         if not eligible:
             continue
@@ -280,6 +288,22 @@ def dwell_progress_problem(mine, dwell):
                 and (expected[1] is None or following.get("stage") == expected[1])):
             return (f"stage {stage} did not advance to {expected[1] or expected[0]} "
                     f"on its first eligible sample at {event['ts']}")
+    return None
+
+
+def regression_problem(history, rid):
+    """`history` is the Watch's list of (t, rollout_id, state, stage) status changes. A rollout's status may
+    only move forward: stage 1 -> 2 -> 3 while shifting, then one terminal state that never changes."""
+    prev = None
+    for t, r, state, stage in history:
+        if r != rid or state not in ("shifting", "promoted", "aborted"): continue
+        if prev:
+            p_state, p_stage = prev
+            if p_state in ("promoted", "aborted") and (state, stage) != prev:
+                return f"status went from {p_state} back to {state} stage {stage}"
+            if p_state == state == "shifting" and isint(stage) and isint(p_stage) and stage < p_stage:
+                return f"status went from stage {p_stage} back to stage {stage}"
+        prev = (state, stage)
     return None
 
 
@@ -317,24 +341,6 @@ def read_events(offset):
     try:
         with open(EVENTS, "rb") as f: f.seek(offset); return parse_events(f.read().decode(errors="replace").splitlines())
     except OSError as e: return [], [str(e)]
-
-
-def omit_decision_event(rollout_id, event_type, **match):
-    """Leave a durable decision's event absent to exercise recovery; preserve byte offsets."""
-    with open(EVENTS, "r+b") as f:
-        lines = f.readlines()
-        offset = 0
-        for line in lines:
-            try: event = json.loads(line)
-            except ValueError: event = None
-            if (isinstance(event, dict) and event.get("rollout_id") == rollout_id
-                    and event.get("type") == event_type
-                    and all(event.get(key) == value for key, value in match.items())):
-                replacement = b" " * (len(line) - 1) + b"\n" if line.endswith(b"\n") else b" " * len(line)
-                f.seek(offset); f.write(replacement); f.flush(); os.fsync(f.fileno())
-                return True
-            offset += len(line)
-    return True
 
 
 def fresh():
@@ -379,7 +385,7 @@ class Load:
 class Watch:
     """Poll the status file every 0.2 s: validate it and record when each stage/terminal state first appears."""
     def __init__(self, allow_missing=False):
-        self.first, self.first_monotonic = {}, {}
+        self.first, self.first_monotonic, self.history = {}, {}, []
         self.run, self.bad, self.allow_missing = True, [], allow_missing
         self.last_status, self.terminal_wait_diagnostic = {}, None
         self.thread = None
@@ -390,6 +396,8 @@ class Watch:
             self.last_status = s
             p = status_problem(s)
             if p and len(self.bad) < 5: self.bad.append(f"{p}: {s}")
+            change = (s.get("rollout_id"), s.get("state"), s.get("stage"))
+            if not self.history or self.history[-1][1:] != change: self.history.append((time.time(), *change))
             key = s.get("state") if s.get("state") in ("promoted", "aborted") else ("stage", s.get("stage"))
             self.first.setdefault(key, time.time())
             self.first_monotonic.setdefault(key, time.monotonic())
@@ -472,8 +480,9 @@ def proc_snapshot():
 
 
 def file_privilege_problems():
-    fc = subprocess.run("getcap -r /opt/canary /usr/sbin /usr/bin /usr/local/bin /usr/local/sbin 2>/dev/null",
-                        shell=True, capture_output=True, text=True).stdout.strip()
+    # every regular file outside the kernel's pseudo-filesystems ("grant no file capabilities anywhere")
+    fc = subprocess.run("find / \\( -path /proc -o -path /sys -o -path /dev \\) -prune -o -type f -print0 2>/dev/null"
+                        " | xargs -0 -r getcap 2>/dev/null", shell=True, capture_output=True, text=True).stdout.strip()
     su = subprocess.run("find /opt/canary -perm /6000 -type f 2>/dev/null", shell=True, capture_output=True, text=True).stdout.strip()
     return [x for x in (fc, su) if x]
 
@@ -601,3 +610,98 @@ def kill_engine():
         try: os.kill(pid, 9)
         except OSError: pass
     return pid
+
+
+# ---------------------------------------------------------------- nginx processes, kills inside a decision
+
+def _ppid(pid):
+    try:
+        with open(f"/proc/{pid}/stat") as f: return int(f.read().rsplit(")", 1)[1].split()[1])
+    except (OSError, ValueError, IndexError): return None
+
+
+def nginx_master():
+    """The nginx master serving :8080: the listener whose parent is not itself a listener."""
+    pids = listener_pids()
+    masters = [p for p in pids if _ppid(p) not in pids]
+    return masters[0] if len(masters) == 1 else None
+
+
+def nginx_workers(master):
+    """Children of the nginx master (its workers), or None if the master is gone."""
+    if not process_alive(master): return None
+    try:
+        with open(f"/proc/{master}/task/{master}/children") as f: return frozenset(int(x) for x in f.read().split())
+    except OSError:                                          # kernel without /proc/<pid>/task/<tid>/children
+        return frozenset(int(p) for p in os.listdir("/proc") if p.isdigit() and _ppid(int(p)) == master)
+
+
+class _EventTail:
+    """New complete lines appended to the event log since construction."""
+    def __init__(self):
+        try: self.offset = os.path.getsize(EVENTS)
+        except OSError: self.offset = 0
+        self.buf = b""
+    def new(self):
+        try:
+            if os.path.getsize(EVENTS) <= self.offset: return []
+            with open(EVENTS, "rb") as f: f.seek(self.offset); data = f.read()
+        except OSError: return []
+        self.offset += len(data); self.buf += data
+        *lines, self.buf = self.buf.split(b"\n")
+        out = []
+        for line in lines:
+            try: out.append(json.loads(line))
+            except ValueError: pass
+        return out
+
+
+def kill_at_decision(channel, timeout, action=None):
+    """Wait for the running rollout's next decision (stage change, abort or promotion) to become visible
+    through one channel, and SIGKILL the engine (or run `action`) the moment it does:
+      nginx  - the nginx master's set of workers changes (a reload: the decision reached the ingress)
+      event  - a decision event for the rollout is appended to the event log
+      status - status.json shows a new state or stage (the decision was reported)
+    Whatever the engine had not yet done at that moment, it must finish on recovery: the instruction's
+    crash model is SIGKILL at any moment, and this is just a well-chosen moment. Returns what happened;
+    `fired` is False if the decision never became visible."""
+    st = status(); rid, pid = st.get("rollout_id"), st.get("pid")
+    base_key = (st.get("state"), st.get("stage"))
+    act = action or (lambda: os.kill(pid, 9) if isint(pid) else None)
+    out = {"channel": channel, "fired": False, "pid": pid, "before": base_key}
+    since = _EventTail()
+    if channel == "nginx":
+        master = nginx_master(); base = nginx_workers(master) if master else None
+        if base is None: out["error"] = "no single nginx master found"; return out
+        def probe(): return nginx_workers(master) != base
+    elif channel == "event":
+        tail, stage = _EventTail(), st.get("stage") or 0
+        def probe():
+            return any(e.get("rollout_id") == rid and (e.get("type") in ("promoted", "aborted")
+                       or (e.get("type") == "stage" and isint(e.get("stage")) and e["stage"] > stage)) for e in tail.new())
+    elif channel == "status":
+        last = [None]
+        def probe():
+            try: s = os.stat(STATUS); key = (s.st_ino, s.st_mtime_ns)
+            except OSError: return False
+            if key == last[0]: return False
+            last[0] = key; cur = status()
+            return bool(cur) and cur.get("rollout_id") == rid and (cur.get("state"), cur.get("stage")) != base_key
+    else:
+        raise ValueError(channel)
+    import sys
+    old = sys.getswitchinterval(); sys.setswitchinterval(0.0002)     # don't let the load threads delay the kill
+    try:
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            if probe():
+                out["t"] = time.time(); act(); out["fired"] = True; break
+            time.sleep(0.0005)
+    finally:
+        sys.setswitchinterval(old)
+    if out["fired"]:
+        # diagnostics only: which parts of the decision the engine had completed when it died
+        s = status(); out["status_at_kill"] = (s.get("state"), s.get("stage"))
+        out["logged_at_kill"] = [(e.get("type"), e.get("stage")) for e in since.new()
+                                 if e.get("rollout_id") == rid and e.get("type") in ("stage", "aborted", "promoted")]
+    return out

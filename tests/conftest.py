@@ -14,8 +14,8 @@ if os.environ.get("CANARY_SELFTEST") != "1":
     try: EVENTS_OFFSET = os.path.getsize(H.EVENTS)        # judge only event lines written during grading
     except OSError: EVENTS_OFFSET = 0
 
-PROMOTE = ["healthy", "green3", "blue30", "bursty"]
-ABORT = ["green8", "crash", "hang", "proxykill", "killfault"]
+PROMOTE = ["healthy", "green3", "blue30", "bursty", "workerkill"]
+ABORT = ["green8", "crash", "hang", "proxykill", "masterkill", "killfault"]
 
 _cache = {}
 
@@ -29,6 +29,7 @@ def scenario():
             elif name == "notraffic": _cache[name] = S.run_notraffic(EVENTS_OFFSET)
             elif name == "chaos": _cache[name] = S.run_chaos(EVENTS_OFFSET)
             elif name == "abortreboot": _cache[name] = S.run_abort_reboot(EVENTS_OFFSET)
+            elif name == "concurrentup": _cache[name] = S.run_concurrent_up(EVENTS_OFFSET)
             elif name == "ingress": _cache[name] = S.run_ingress_check(EVENTS_OFFSET)
             else: raise KeyError(name)
         return _cache[name]

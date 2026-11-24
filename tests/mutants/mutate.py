@@ -39,6 +39,31 @@ MUTANTS = {
     "no_reconcile_events": [("engine.py", "reconcile_events(st)\npublish(0, 0)", "publish(0, 0)"),
                             ("canaryctl", "        reconcile_events(st)                       # a decision the crash cut off still gets logged once",
                              "        pass")],
+    # --- decisions that are not durable at the moment they show (caught by kills inside a decision)
+    "apply_before_save": [("engine.py", 'st.update(stage=st["stage"] + 1, stage_entered_at=time.time(), window=win(n, e)); save_state(st)\n        apply(st); publish(n, e)',
+                           'st.update(stage=st["stage"] + 1, stage_entered_at=time.time(), window=win(n, e))\n        apply(st); save_state(st); publish(n, e)')],
+    "persist_last":      [("engine.py", 'st.update(stage=st["stage"] + 1, stage_entered_at=time.time(), window=win(n, e)); save_state(st)\n        apply(st); publish(n, e)\n'
+                           '        event({"type": "stage", "rollout_id": rid, "stage": st["stage"], "weights": W(*STAGES[st["stage"]])})',
+                           'st.update(stage=st["stage"] + 1, stage_entered_at=time.time(), window=win(n, e))\n        apply(st); publish(n, e)\n'
+                           '        event({"type": "stage", "rollout_id": rid, "stage": st["stage"], "weights": W(*STAGES[st["stage"]])}); save_state(st)')],
+    "resumed_before_reconcile": [("engine.py", 'reconcile_events(st)\npublish(0, 0)\nif a.resume: event({"type": "resumed", "rollout_id": rid, "stage": st["stage"]})',
+                                  'publish(0, 0)\nif a.resume: event({"type": "resumed", "rollout_id": rid, "stage": st["stage"]})\nreconcile_events(st)')],
+    # --- ingress liveness: a replaced worker is not a dead ingress; a dead master leaves workers behind
+    "worker_watchdog":   [("engine.py", "nxt = time.monotonic() + PERIOD\nwhile True:\n    if not nginx_pid():",
+                           "def _workers():\n"
+                           "    p = nginx_pid()\n"
+                           "    try:\n"
+                           "        with open(f'/proc/{p}/task/{p}/children') as f: return set(f.read().split())\n"
+                           "    except (OSError, TypeError): return set()\n"
+                           "_known = [_workers()]\n"
+                           "nxt = time.monotonic() + PERIOD\nwhile True:\n"
+                           "    _cur = _workers(); _gone = _known[0] - _cur; _known[0] = _cur\n"
+                           "    if not nginx_pid() or (_gone and time.time() - st['stage_entered_at'] > 3):")],
+    "no_stray_kill":     [("engine.py", "save_state(st); write_conf(100, 0); kill_stray_nginx(os.getuid()); start_nginx()",
+                           "save_state(st); write_conf(100, 0); start_nginx()")],
+    # --- overlapping node-agent commands
+    "up_no_lock":        [("canaryctl", 'if a.cmd == "up":\n    ctl_lock(); up()', 'if a.cmd == "up":\n    up()')],
+    "status_no_recover": [("canaryctl", 'if load_state()["state"] == "shifting" and not engine_pid():', 'if False:')],
     # --- isolation / interface mistakes
     "root_engine":      [("canaryctl", '"nsenter", f"--net={NETNS}", "--", "setpriv", f"--reuid={U.pw_uid}", f"--regid={U.pw_gid}",\n'
                           '                "--clear-groups", "--inh-caps=-all", "--bounding-set=-all", "--no-new-privs", "--"]',

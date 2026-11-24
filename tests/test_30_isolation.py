@@ -4,7 +4,8 @@ import hashlib, subprocess
 import pytest
 import harness as H
 
-WHEN = {"mid-rollout": "healthy", "after-proxy-restart": "proxykill", "after-reboot": "chaos"}
+WHEN = {"mid-rollout": "healthy", "after-proxy-restart": "proxykill", "after-master-restart": "masterkill",
+        "after-reboot": "chaos"}
 
 
 @pytest.mark.parametrize("when", WHEN)

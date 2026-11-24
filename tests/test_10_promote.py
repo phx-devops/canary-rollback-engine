@@ -1,9 +1,10 @@
-"""Rollouts that must be promoted: healthy, app-green at 3 %, app-blue at 30 %, bursty traffic, no traffic."""
+"""Rollouts that must be promoted: healthy, app-green at 3 %, app-blue at 30 %, bursty traffic, nginx workers
+killed (and replaced by nginx), no traffic."""
 import pytest
 import harness as H
 from harness import DWELL
 
-PROMOTE = ["healthy", "green3", "blue30", "bursty"]
+PROMOTE = ["healthy", "green3", "blue30", "bursty", "workerkill"]
 ALL = PROMOTE + ["notraffic"]
 SPLIT = {1: 0.10, 2: 0.50, 3: 1.00}
 
@@ -36,6 +37,13 @@ def test_stages_in_order_and_each_held_for_dwell(scenario, name):
         assert t[i + 1] - t[i] >= DWELL - 1, f"stage {i + 1} held {t[i + 1] - t[i]:.1f}s < dwell {DWELL}s"
 
 
+@pytest.mark.parametrize("name", ALL)
+def test_advances_on_first_eligible_sample_after_dwell(scenario, name):
+    r = scenario(name)
+    p = H.dwell_progress_problem(H.rollout_events(r["events"], r["start"]["rid"]), DWELL)
+    assert p is None, p
+
+
 @pytest.mark.parametrize("stage", [1, 2, 3])
 @pytest.mark.parametrize("name", PROMOTE)
 def test_live_split_matches_stage(scenario, name, stage):
@@ -57,7 +65,6 @@ def test_all_traffic_on_green_after_promotion(scenario, name):
 def test_up_preserves_promoted_state_and_green_traffic(scenario):
     r = scenario("healthy")
     assert r["term"] == "promoted", r["final_status"]
-    assert r.get("promotion_event_omitted"), "did not create the promotion-decision recovery case"
     assert [e["type"] for e in H.rollout_events(r["events"], r["start"]["rid"])].count("promoted") == 1
     up = r["up_after_promotion"]
     status = up["out"]
@@ -67,6 +74,28 @@ def test_up_preserves_promoted_state_and_green_traffic(scenario):
     assert status["weights"] == H.GREEN
     after_up = [item for item in r["rec"] if up["t_done"] <= item[0] < up["t_done"] + 2]
     assert after_up and all(item[2] == 200 and item[3] == "app-green" for item in after_up)
+
+
+def test_live_window_matches_samples_right_after_stage_changes(scenario):
+    checks = scenario("healthy").get("live_window_checks", [])
+    assert [c["label"] for c in checks] == ["stage-2", "stage-3"], checks
+    assert not [c for c in checks if c["problems"]], checks
+
+
+def test_workerkill_replaced_workers_without_abort(scenario):
+    """A worker that nginx replaces by itself is not the ingress stopping: the rollout carries on."""
+    r = scenario("workerkill")
+    kills = r.get("worker_kills", [])
+    assert [k.get("stage") for k in kills] == [2, 3] and not [k for k in kills if "error" in k], kills
+    assert all(k["master_alive"] and k["pid"] not in k["workers_after"] and k["workers_after"] for k in kills), kills
+    assert "aborted" not in r["first"], f"aborted after an nginx worker was replaced: {r['final_status']}"
+
+
+@pytest.mark.parametrize("name", PROMOTE)
+def test_status_never_goes_backwards(scenario, name):
+    r = scenario(name)
+    p = H.regression_problem(r["history"], r["start"]["rid"])
+    assert p is None, p
 
 
 def test_healthy_rollout_has_no_client_errors(scenario):

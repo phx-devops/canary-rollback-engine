@@ -15,7 +15,7 @@ verification_explanation = "The verifier runs in the agent's root-capable contai
 [verifier]
 # test.sh uses the image's system-wide python3-pytest because tests must inspect the live agent container.
 # The verifier runs in the agent's root-capable container; this is not an isolation boundary.
-timeout_sec = 1800
+timeout_sec = 3600
 
 [agent]
 timeout_sec = 28800

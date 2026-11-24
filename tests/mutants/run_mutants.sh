@@ -1,18 +1,25 @@
 #!/bin/bash
 # Prove the suite has teeth: each mutant must make its targeted tests fail (reward 0).
-# Usage: run_mutants.sh [/path/to/solution]     (run as root in the task container)
+# Usage: [ONLY="m1 m2"] run_mutants.sh [/path/to/solution]     (run as root in the task container)
 SRC="${1:-$(cd "$(dirname "$0")/../../solution" && pwd)}"
 HERE="$(cd "$(dirname "$0")" && pwd)"; SUITE="$HERE/.."
 MUTANTS=(mean_of_ratios all_5xx empty_is_healthy reset_dwell_on_resume reset_window_on_stage drain_not_zero no_watchdog
          nginx_max_fails nginx_next_upstream nginx_read_timeout
          up_always_blue no_resume abort_not_durable state_in_run no_resumed_event no_reconcile_events
+         apply_before_save persist_last resumed_before_reconcile worker_watchdog no_stray_kill
+         up_no_lock status_no_recover
          root_engine idle_schema)
+# ONLY="m1 m2 ..." runs just those mutants
+if [ -n "${ONLY:-}" ]; then read -ra MUTANTS <<<"$ONLY"; fi
 declare -A TARGET=(
   [mean_of_ratios]="bursty"  [all_5xx]="blue30"  [empty_is_healthy]="notraffic"  [drain_not_zero]="green8"
-  [reset_dwell_on_resume]="chaos" [reset_window_on_stage]="chaos"
+  [reset_dwell_on_resume]="chaos" [reset_window_on_stage]="chaos or live_window"
   [no_watchdog]="proxykill"  [nginx_max_fails]="crash"  [nginx_next_upstream]="crash"  [nginx_read_timeout]="hang"
   [up_always_blue]="chaos"  [no_resume]="chaos"  [abort_not_durable]="abort_survives_reboot or abort_reboot"  [state_in_run]="chaos"
-  [no_resumed_event]="chaos" [no_reconcile_events]="chaos or abort_reboot_events or up_preserves_promoted_state"
+  [no_resumed_event]="chaos" [no_reconcile_events]="chaos or abort_reboot"
+  [apply_before_save]="chaos" [persist_last]="chaos" [resumed_before_reconcile]="chaos"
+  [worker_watchdog]="workerkill" [no_stray_kill]="masterkill"
+  [up_no_lock]="concurrent" [status_no_recover]="status_after_engine_death"
   [root_engine]="mid-rollout"  [idle_schema]="test_00_cli"
 )
 reinstall() {
